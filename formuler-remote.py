@@ -161,6 +161,7 @@ _timing = CONFIG.get("timing", {})
 NAV_DELAY = float(_timing.get("nav_delay", 0.25))
 LOAD_DELAY = float(_timing.get("load_delay", 2.0))
 SEARCH_DELAY = float(_timing.get("search_delay", 1.5))
+PLAYBACK_TIMEOUT = float(_timing.get("playback_timeout", 60.0))  # max wait for VOD to start; slow providers take ~50s
 
 KEYS = {
     "power": 26, "home": 3, "back": 4, "menu": 82,
@@ -674,15 +675,38 @@ def open_search(ip: str, section: str = "vod"):
     Verified via UI dump: search icon has resource-id 'dashboard_overview_option'.
     """
     go_to_section(ip, section)
+
+    # Wait for the section page: pressing on before it loads lands OK on a tile
+    icon = "dashboard_overview_option"
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        root = _ui_root(ip)
+        if root is not None and any(_rid(n) == icon for n in root.iter("node")):
+            break
+        wait(0.5)
+
     key(ip, "right")
     wait(NAV_DELAY)
-    for _ in range(10):
-        key(ip, "up")
-        wait(NAV_DELAY * 0.6)
+    for _ in range(2):
+        for _ in range(10):
+            key(ip, "up")
+            wait(NAV_DELAY * 0.6)
+        root = _ui_root(ip)
+        if root is not None and any(n.get("focused") == "true" and _rid(n) == icon
+                                    for n in root.iter("node")):
+            break
+    else:
+        return False
     key(ip, "ok")
     wait(SEARCH_DELAY)
-    # Verify we landed on the search activity
-    _wait_for_activity(ip, "UsActivity", timeout=5)
+
+    # Verify we landed on the search screen (not e.g. a detail page)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if _get_current_activity(ip) == "UsActivity":
+            return True
+        wait(0.5)
+    return False
 
 
 def _wait_for_activity(ip: str, name: str, timeout: float = 5) -> bool:
@@ -735,12 +759,19 @@ def do_search(ip: str, query: str, section: str = "vod"):
     3. Press Enter → results appear with category tabs
     """
     _reset_to_live(ip)
-    open_search(ip, section)
+    if not open_search(ip, section):
+        # Retry once from a fresh app start
+        adb(ip, "shell", "am", "force-stop", MOL3_PKG)
+        _reset_to_live(ip)
+        if not open_search(ip, section):
+            output_err(f"Could not open the search screen in {section}")
+            return False
     text_input(ip, query)
     wait(NAV_DELAY * 2)
-    key(ip, "ok")  # submit search
+    key(ip, "ok")  # submit search (Enter; DPAD_CENTER would type on the on-screen keyboard)
     wait(LOAD_DELAY)
     output_ok(f"Searched for '{query}' in {section}")
+    return True
 
 
 def select_first_result(ip: str):
@@ -960,9 +991,9 @@ def play_movie(ip: str, query: str):
             intent = _build_stalker_deeplink("movie", match["stream_id"], match["category_id"])
         if intent:
             ensure_mytv(ip)  # deeplink needs MOL3 running
+            before = _mol3_media_players(ip)
             if launch_intent(ip, intent):
                 # Deeplink with history channel_type auto-plays without detail page.
-                # Verify if connection is stable, otherwise trust the deeplink.
                 verified = _verify_playback(ip, timeout=3.5)
                 method = "deeplink" if verified else "deeplink+ok"
                 if not verified:
@@ -970,24 +1001,23 @@ def play_movie(ip: str, query: str):
                     key(ip, "down")
                     wait(NAV_DELAY)
                     key(ip, "ok")
-                output_ok(f"Playing movie: '{match['title']}'", {
+                _report_playback(ip, before, f"movie: '{match['title']}'", {
                     "query": query, "title": match["title"],
                     "stream_id": match["stream_id"], "method": method
                 })
-                _notify("Formuler Remote", f"Playing: {match['title']}")
                 return
 
     # Slow path: UI-based search
-    do_search(ip, query, section="vod")
+    if not do_search(ip, query, section="vod"):
+        return
     select_first_result(ip)
     # Detail overlay: focus is on description. Down to "Regarder" button.
     wait(LOAD_DELAY * 0.5)
     key(ip, "down")   # description → "Regarder" button
     wait(NAV_DELAY)
+    before = _mol3_media_players(ip)
     key(ip, "ok")     # start playback
-    wait(LOAD_DELAY * 0.5)
-    output_ok(f"Playing movie: '{query}'", {"query": query, "method": "search"})
-    _notify("Formuler Remote", f"Playing: {query}")
+    _report_playback(ip, before, f"movie: '{query}'", {"query": query, "method": "search"})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1019,6 +1049,7 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
         if stream_id and category_id:
             ensure_mytv(ip)  # deeplink needs MOL3 running
             intent = _build_stalker_deeplink("tv", stream_id, category_id, season, episode)
+            before = _mol3_media_players(ip)
             if launch_intent(ip, intent):
                 # Deeplink with history channel_type auto-plays without detail page.
                 verified = _verify_playback(ip, timeout=3.5)
@@ -1026,16 +1057,16 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
                 if not verified:
                     # Safety: press OK in case detail page appeared
                     key(ip, "ok")
-                output_ok(f"Playing {label}", {
+                _report_playback(ip, before, label, {
                     "query": query, "title": match["title"],
                     "stream_id": stream_id, "season": season,
                     "episode": episode, "method": method
                 })
-                _notify("Formuler Remote", f"Playing: {label}")
                 return
 
     # Slow path: UI-based search
-    do_search(ip, query, section="series")
+    if not do_search(ip, query, section="series"):
+        return
     title = select_matching_result(ip, query)
     if not title:
         output_err(f"No series result matching '{query}'")
@@ -1051,13 +1082,12 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
         return
 
     # Play
+    before = _mol3_media_players(ip)
     key(ip, "ok")
-    wait(LOAD_DELAY * 0.5)
     label = f"'{_clean_result_title(title)}' S{season:02d}E{episode:02d}"
-    output_ok(f"Playing {label}", {
+    _report_playback(ip, before, label, {
         "query": query, "title": title, "season": season, "episode": episode, "method": "search"
     })
-    _notify("Formuler Remote", f"Playing: {label}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1364,6 +1394,77 @@ def _verify_playback(ip: str, timeout: float = 3.5) -> bool:
             return True
         time.sleep(0.5)
     return False
+
+
+def _mol3_media_players(ip: str) -> set[str]:
+    """IDs (piid) of MyTVOnline media players that are currently playing.
+
+    Read from `dumpsys audio`: a started USAGE_MEDIA AudioTrack owned by the
+    MOL3 process means the player is actually rendering content. This holds
+    while the TV is muted or scrcpy captures the audio.
+    """
+    code, pid = adb(ip, "shell", "pidof", MOL3_PKG, timeout=5)
+    pid = pid.strip().split()[0] if code == 0 and pid.strip() else ""
+    if not pid:
+        return set()
+    code, out = adb(ip, "shell", "dumpsys audio | grep AudioPlaybackConfiguration", timeout=8)
+    players = set()
+    for line in out.splitlines():
+        if f"/{pid} " in line and "state:started" in line and "USAGE_MEDIA" in line:
+            m = re.search(r"piid:(\d+)", line)
+            if m:
+                players.add(m.group(1))
+    return players
+
+
+def _player_error(ip: str) -> str | None:
+    """Return the message of a player error dialog on screen, if any."""
+    root = _ui_root(ip)
+    if root is None:
+        return None
+    texts = {_rid(n): n.get("text", "") for n in root.iter("node") if _rid(n).startswith("dialog_")}
+    message = texts.get("dialog_message", "")
+    # The stop confirmation ("Stop afspelen?") uses the same dialog layout
+    if not message or "stop" in _normalize(message):
+        return None
+    title = texts.get("dialog_title", "")
+    return f"{title}: {message}" if title else message
+
+
+def _wait_for_playback(ip: str, before: set[str], timeout: float = 30) -> tuple[bool, str]:
+    """Wait until a new MOL3 media player is playing, or an error dialog shows.
+
+    `before` holds the players that were already playing (e.g. live TV) so they
+    don't count. Requires two consecutive hits so a player that starts and
+    immediately fails isn't reported as playing. Returns (ok, reason).
+    """
+    deadline = time.time() + timeout
+    hits = 0
+    while time.time() < deadline:
+        if _mol3_media_players(ip) - before:
+            hits += 1
+            if hits >= 2:
+                return True, "playing"
+        else:
+            hits = 0
+            err = _player_error(ip)
+            if err:
+                return False, err
+        time.sleep(1.5)
+    return False, f"no playback after {int(timeout)}s (still loading?)"
+
+
+def _report_playback(ip: str, before: set[str], label: str, data: dict):
+    """Report success only once playback is confirmed, otherwise the reason."""
+    if DRY_RUN:
+        output_ok(f"Playing {label}", data)
+        return
+    ok, reason = _wait_for_playback(ip, before, timeout=PLAYBACK_TIMEOUT)
+    if ok:
+        output_ok(f"Playing {label}", {**data, "verified": True})
+        _notify("Formuler Remote", f"Playing: {label}")
+    else:
+        output_err(f"Could not play {label}: {reason}", {**data, "verified": False})
 
 
 def _query_vod_content(ip: str, query: str, stream_type: str = "") -> list[dict]:
@@ -2118,6 +2219,26 @@ def cmd_record_screen(ip: str, duration: int = 30, path: str = str(TMP_DIR / "fo
 _keep_connection = False  # set when a command (mirror) still needs the ADB connection after exit
 
 
+def _mirror_running() -> bool:
+    """True if a scrcpy mirror is running; it needs the ADB connection kept open."""
+    if os.name == "nt":
+        cmd = ["tasklist", "/FI", "IMAGENAME eq scrcpy.exe", "/NH"]
+    else:
+        cmd = ["pgrep", "-x", "scrcpy"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "scrcpy" in out.lower() if os.name == "nt" else bool(out.strip())
+
+
+def _disconnect(ip: str):
+    """Disconnect ADB unless a mirror (this run or an earlier one) still uses it."""
+    if _keep_connection or _mirror_running():
+        return
+    run_adb("disconnect", tgt(ip))
+
+
 def _find_scrcpy() -> str | None:
     found = shutil.which("scrcpy")
     if found or os.name != "nt":
@@ -2160,19 +2281,29 @@ def cmd_mirror(ip: str, tv_audio: bool = False, fullscreen: bool = False):
         print(f"[dry-run] {' '.join(args)}", file=sys.stderr)
         return
     log = open(log_path, "w", encoding="utf-8")
-    # Detach so the window outlives this command
+    # Run independently of this command so the window outlives it. On Windows use a
+    # hidden console (CREATE_NO_WINDOW): with DETACHED_PROCESS the adb.exe that
+    # scrcpy spawns fails to start (0xC0000142).
     if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
     else:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
 
-    # scrcpy exits within a few seconds when it can't start (device, codec, options)
-    time.sleep(4)
-    if proc.poll() is not None:
+    # Started once the video decoder reports its texture; scrcpy exits on failure
+    deadline = time.time() + 15
+    started = False
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.5)
+        if "Texture" in log_path.read_text(encoding="utf-8", errors="replace"):
+            started = True
+            break
+    if not started:
+        if proc.poll() is None:
+            proc.kill()
         log.close()
         tail = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-3:]
-        output_err(f"scrcpy exited: {' | '.join(tail)}", {"log": str(log_path)})
+        output_err(f"scrcpy did not start: {' | '.join(tail)}", {"log": str(log_path)})
         return
 
     _keep_connection = True
@@ -2776,9 +2907,8 @@ def interactive(ip: str):
     for t in _timers:
         t["timer"].cancel()
 
-    if not _keep_connection:
-        run_adb("disconnect", tgt(ip))
-        info("Disconnected.")
+    _disconnect(ip)
+    info("Disconnected.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2920,8 +3050,7 @@ def main():
                 dispatch_chain(ip, line)
                 if post_wait > 0:
                     time.sleep(post_wait)
-            if not _keep_connection:
-                run_adb("disconnect", tgt(ip))
+            _disconnect(ip)
             sys.exit(_exit_code)
         else:
             interactive(ip)
@@ -2931,8 +3060,7 @@ def main():
     dispatch_chain(ip, cmd_str)
     if post_wait > 0:
         time.sleep(post_wait)
-    if not _keep_connection:  # mirror keeps using the connection after we exit
-        run_adb("disconnect", tgt(ip))
+    _disconnect(ip)
     sys.exit(_exit_code)
 
 

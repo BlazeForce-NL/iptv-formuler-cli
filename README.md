@@ -425,6 +425,7 @@ channels_max_age_hours = 24
 nav_delay = 0.25
 load_delay = 2.0
 search_delay = 1.5
+playback_timeout = 60
 
 [aliases]
 tf1 = "TF1 HD"
@@ -472,6 +473,7 @@ Device navigation speed can be tuned in the `[timing]` section of your config fi
 nav_delay = 0.25    # seconds between key presses (default 0.25)
 load_delay = 2.0    # seconds after opening screens (default 2.0)
 search_delay = 1.5  # seconds after search input (default 1.5)
+playback_timeout = 60  # max seconds to wait for VOD playback to start (default 60)
 ```
 
 Useful if your device responds faster or slower than the defaults.
