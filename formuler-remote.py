@@ -2932,10 +2932,145 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                for c in data]
         return sorted(out, key=lambda c: int(c["number"]) if str(c["number"]).isdigit() else 1 << 30)
 
+    # ── Live stream to the browser ──
+    # scrcpy (no window) records the box's screen + audio to a growing MKV; ffmpeg
+    # follows that file and cuts it into ~1s HLS segments without re-encoding.
+    # scrcpy handles the device protocol and A/V timestamps, which raw H.264 lacks.
+    live = {"scrcpy": None, "ffmpeg": None, "dir": TMP_DIR / "formuler-live", "logs": []}
+    live_lock = threading.Lock()
+    LIVE_MAX_BYTES = 1500 * 1024 * 1024  # restart before the MKV gets huge (~70 min)
+
+    def _kill(proc):
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _live_running() -> bool:
+        return all(live[k] is not None and live[k].poll() is None for k in ("scrcpy", "ffmpeg"))
+
+    def _live_stop_locked():
+        _kill(live["ffmpeg"])
+        _kill(live["scrcpy"])
+        live["ffmpeg"] = live["scrcpy"] = None
+        for log in live["logs"]:  # open handles would block deleting the dir on Windows
+            log.close()
+        live["logs"] = []
+        # scrcpy's adb child can hold its log open a moment longer; retry briefly
+        for _ in range(6):
+            shutil.rmtree(live["dir"], ignore_errors=True)
+            if not live["dir"].exists():
+                break
+            time.sleep(0.5)
+
+    def _spawn(args, log_path):
+        log = open(log_path, "w", encoding="utf-8")
+        live["logs"].append(log)
+        if os.name == "nt":
+            # hidden console: scrcpy's adb.exe can't start without one (0xC0000142)
+            return subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+        return subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+
+    def _log_tail(name: str) -> str:
+        try:
+            lines = (live["dir"] / name).read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        except OSError:
+            return ""
+        return " | ".join(lines[-2:])
+
+    def live_start() -> dict:
+        with live_lock:
+            if _live_running():
+                return {"ok": True, "url": "/live/live.m3u8"}
+            _live_stop_locked()
+            exe, ffmpeg = _find_scrcpy(), shutil.which("ffmpeg")
+            if not exe:
+                return {"ok": False, "error": "scrcpy not found (winget install Genymobile.scrcpy)"}
+            if not ffmpeg:
+                return {"ok": False, "error": "ffmpeg not found (winget install Gyan.FFmpeg)"}
+            d = live["dir"]
+            (d / "hls").mkdir(parents=True, exist_ok=True)
+            mkv = d / "live.mkv"
+            env_adb = shutil.which("adb")
+            if env_adb:
+                os.environ["ADB"] = env_adb  # same adb as the CLI; inherited by scrcpy
+            live["scrcpy"] = _spawn(
+                [exe, "--serial", tgt(ip), "--no-window", "--no-audio-playback", "--no-control",
+                 "--no-power-on", "--audio-codec=aac", "--max-size=1280", "--video-bit-rate=3M",
+                 # a keyframe every second, so HLS can cut ~1s segments
+                 "--video-codec-options=i-frame-interval:int=1", f"--record={mkv}"],
+                d / "scrcpy.log")
+            deadline = time.time() + 20
+            while time.time() < deadline and live["scrcpy"].poll() is None:
+                if mkv.exists() and mkv.stat().st_size > 0:
+                    break
+                time.sleep(0.5)
+            else:
+                err = _log_tail("scrcpy.log") or "no video/audio from the box"
+                _live_stop_locked()
+                return {"ok": False, "error": f"Stream did not start: {err}"}
+            live["ffmpeg"] = _spawn(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-follow", "1", "-i", f"file:{mkv}",
+                 "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
+                 "-hls_flags", "delete_segments+omit_endlist+independent_segments",
+                 str(d / "hls" / "live.m3u8")],
+                d / "ffmpeg.log")
+            deadline = time.time() + 20
+            while time.time() < deadline and _live_running():
+                if (d / "hls" / "live.m3u8").exists():
+                    return {"ok": True, "url": "/live/live.m3u8"}
+                time.sleep(0.5)
+            err = _log_tail("ffmpeg.log") or _log_tail("scrcpy.log") or "no segments produced"
+            _live_stop_locked()
+            return {"ok": False, "error": f"Stream did not start: {err}"}
+
+    def live_stop() -> dict:
+        with live_lock:
+            _live_stop_locked()
+        return {"ok": True}
+
+    def live_watchdog():
+        while True:
+            time.sleep(30)
+            with live_lock:
+                running = _live_running()
+                mkv = live["dir"] / "live.mkv"
+                too_big = running and mkv.exists() and mkv.stat().st_size > LIVE_MAX_BYTES
+            if too_big:
+                live_stop()
+                live_start()
+
+    threading.Thread(target=live_watchdog, daemon=True).start()
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         return {"ok": bool(activity), "activity": activity,
-                "playing": bool(_mol3_media_players(ip)), "mirror": _mirror_running()}
+                # the stream's own scrcpy process would otherwise show up as a mirror
+                "playing": bool(_mol3_media_players(ip)),
+                "mirror": _mirror_running() and not _live_running(),
+                "streaming": _live_running()}
+
+    def live_file(name: str) -> tuple[bytes, str] | None:
+        """HLS playlist (segment URLs get the token appended) or a segment."""
+        hls = live["dir"] / "hls"
+        if name == "live.m3u8":
+            try:
+                text = (hls / name).read_text(encoding="utf-8")
+            except OSError:
+                return None
+            # Players fetch segments by relative URL without our header, so carry the token
+            lines = [ln if not ln or ln.startswith("#") else f"{ln}?t={token}" for ln in text.splitlines()]
+            return "\n".join(lines).encode("utf-8") + b"\n", "application/vnd.apple.mpegurl"
+        if re.fullmatch(r"live\d+\.ts", name):
+            try:
+                return (hls / name).read_bytes(), "video/mp2t"
+            except OSError:
+                return None
+        return None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -2975,6 +3110,12 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     self._send(200, png, "image/png")
                 else:
                     self._json({"ok": False, "error": "Screenshot failed"}, 502)
+            elif path.startswith("/live/"):
+                found = live_file(path[len("/live/"):])
+                if found:
+                    self._send(200, *found)
+                else:
+                    self._json({"ok": False, "error": "Not found"}, 404)
             else:
                 self._json({"ok": False, "error": "Not found"}, 404)
 
@@ -2991,6 +3132,14 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 self._json(press(str(body.get("key", ""))))
             elif path == "/api/cmd":
                 self._json(run_cli(str(body.get("cmd", ""))))
+            elif path == "/api/stream":
+                action = body.get("action")
+                if action == "start":
+                    self._json(live_start())
+                elif action == "stop":
+                    self._json(live_stop())
+                else:
+                    self._json({"ok": False, "error": "action must be start or stop"}, 400)
             else:
                 self._json({"ok": False, "error": "Not found"}, 404)
 
@@ -3013,6 +3162,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         pass
     finally:
         server.server_close()
+        live_stop()  # gives the TV its sound back
         if key_shell["proc"] is not None:
             key_shell["proc"].kill()
         _keep_connection = False
@@ -3063,7 +3213,7 @@ button:disabled { opacity: .5; }
 .rocker span { text-align: center; font-size: 12px; color: var(--muted); }
 .stack { display: grid; gap: 16px; }
 .preview { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16/9; }
-.preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.preview img, .preview video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
 .preview .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 [hidden] { display: none !important; }
 label.toggle { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
@@ -3132,6 +3282,17 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
   </div>
 
   <div class="stack">
+    <section aria-label="Watch">
+      <h2>Watch here</h2>
+      <div class="preview"><video id="live" playsinline controls hidden></video>
+        <div id="live-empty" class="empty">Stream the TV picture and sound to this device</div></div>
+      <div class="row" style="margin-top:10px">
+        <button id="watch" class="primary">Watch here</button>
+        <button id="unwatch" disabled>Stop</button>
+      </div>
+      <p class="hint">Runs a few seconds behind the TV. On this box (Android 11) the TV is muted while streaming; Stop gives the sound back.</p>
+    </section>
+
     <section aria-label="Screen">
       <h2>Screen</h2>
       <div class="preview"><img id="shot" alt="TV screen" hidden><div id="shot-empty" class="empty">No screenshot yet</div></div>
@@ -3261,12 +3422,57 @@ $("#kind").onchange = () => {
   const movie = $("#kind").value === "movie";
   $("#season").hidden = $("#episode").hidden = movie;
 };
+let hls = null;
+function loadScript(src) {
+  return new Promise((ok, fail) => { const s = document.createElement("script");
+    s.src = src; s.onload = ok; s.onerror = fail; document.head.append(s); });
+}
+async function attachStream(url) {
+  const v = $("#live");
+  v.hidden = false; $("#live-empty").hidden = true;
+  // Prefer hls.js (MSE): Chrome's experimental native HLS stalls on this live stream.
+  // Fall back to native HLS for browsers without MSE (older iPhones).
+  if (!window.Hls) await loadScript("https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js").catch(() => {});
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxLiveSyncPlaybackRate: 1.2 });
+    hls.loadSource(url); hls.attachMedia(v);
+  } else if (v.canPlayType("application/vnd.apple.mpegurl")) {
+    v.src = url;
+  } else {
+    throw new Error("This browser can't play the stream");
+  }
+  await v.play().catch(() => {});  // started from a click, so sound is allowed
+}
+function detachStream() {
+  const v = $("#live");
+  if (hls) { hls.destroy(); hls = null; }
+  v.pause(); v.removeAttribute("src"); v.load();
+  v.hidden = true; $("#live-empty").hidden = false;
+}
+$("#watch").onclick = async () => {
+  const b = $("#watch"); b.disabled = true;
+  toast("Starting stream… (about 10 seconds)");
+  try {
+    const r = await api("/api/stream", { action: "start" });
+    if (!r.ok) { toast(r.error || "Stream failed", true); b.disabled = false; return; }
+    await attachStream(r.url + "?t=" + encodeURIComponent(token));
+    $("#unwatch").disabled = false;
+    toast("Streaming. The TV is muted until you press Stop.");
+  } catch (e) { toast(e.message || "Stream failed", true); b.disabled = false; }
+};
+$("#unwatch").onclick = async () => {
+  detachStream();
+  await api("/api/stream", { action: "stop" });
+  $("#watch").disabled = false; $("#unwatch").disabled = true;
+  toast("Stream stopped, sound is back on the TV");
+};
 async function refreshState() {
   try {
     const s = await api("/api/status");
     const el = $("#state");
     const label = s.activity === "LiveActivity" ? "Live TV" : (s.activity || "Offline").replace(/Activity$/, "");
-    el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "");
+    el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "") + (s.streaming ? " · streaming" : "");
+    if (s.streaming) $("#unwatch").disabled = false;  // also when started from another device
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }

@@ -31,7 +31,7 @@ Single-file Python script, zero dependencies beyond stdlib. Control your Formule
 - **CEC control** — power TV on/off through the Formuler box
 - **Screen capture** — screenshots and screen recording
 - **Screen mirroring** — live view of the box on your computer via [scrcpy](https://github.com/Genymobile/scrcpy), with audio here or on the TV
-- **Web remote** — `serve` gives a token-protected remote control page for phone/tablet on your network
+- **Web remote** — `serve` gives a token-protected remote control page for phone/tablet on your network, including a live picture + sound stream ("Watch here")
 - **Playback check** — `play-movie`/`play-series` only report success once the player is actually playing
 - **M3U export** — export channel lineup as M3U playlist
 - **Shell completions** — bash, zsh, and fish completion scripts
@@ -198,6 +198,7 @@ It prints a link like `http://192.168.0.185:8765/?t=…`. Open it on your phone 
 - **Access token:** every request needs the token in the link. It is stored in `~/.cache/formuler-remote/web_token` so bookmarks survive restarts; delete that file to revoke old links.
 - **Allowed commands:** the page can only run remote-control commands (tune, play, open, mirror, …), not `reboot`, `serve`, `watch` or `record`.
 - **Speed:** key presses go through one persistent `adb shell`; other commands run one at a time through the CLI.
+- **Watch here:** streams the box's picture and sound to the browser (needs [scrcpy](https://github.com/Genymobile/scrcpy) and [ffmpeg](https://ffmpeg.org/): `winget install Genymobile.scrcpy Gyan.FFmpeg`). scrcpy records the screen without a window, ffmpeg turns it into ~1s HLS segments, and the page plays them with [hls.js](https://github.com/video-dev/hls.js) (native HLS as fallback). Expect a few seconds of delay. On Android 11 the TV is muted while streaming; **Stop** gives the sound back. The stream restarts itself every ~70 minutes to keep its temp file small.
 - **Windows:** allow Python through the firewall for private networks when asked, otherwise the phone can't connect.
 
 ### Interactive Mode
