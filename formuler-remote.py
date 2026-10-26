@@ -708,6 +708,23 @@ def _get_current_activity(ip: str) -> str:
     return ""
 
 
+def _reset_to_live(ip: str):
+    """Make sure MyTVOnline starts from its live TV screen.
+
+    Section navigation (menu → down×N → ok) only works from LiveActivity. From a
+    VOD player, detail page or the search screen those keys land elsewhere (e.g.
+    "Continue" on a detail page), so restart the app in that case.
+    """
+    if _get_current_activity(ip) == "LiveActivity":
+        return
+    adb(ip, "shell", "am", "force-stop", MOL3_PKG)
+    wait(NAV_DELAY * 2)
+    adb(ip, "shell", "monkey", "-p", MOL3_PKG, "-c", "android.intent.category.LAUNCHER", "1")
+    if not _wait_for_activity(ip, "LiveActivity", timeout=15):
+        warn("MyTVOnline did not return to live TV; search navigation may be off")
+    wait(LOAD_DELAY)
+
+
 def do_search(ip: str, query: str, section: str = "vod"):
     """Search for content using the universal search UI.
 
@@ -716,6 +733,7 @@ def do_search(ip: str, query: str, section: str = "vod"):
     2. Type query (spaces encoded as %s for ADB)
     3. Press Enter → results appear with category tabs
     """
+    _reset_to_live(ip)
     open_search(ip, section)
     text_input(ip, query)
     wait(NAV_DELAY * 2)
@@ -737,6 +755,169 @@ def select_first_result(ip: str):
     wait(NAV_DELAY)
     key(ip, "ok")
     wait(LOAD_DELAY)
+
+
+def _ui_root(ip: str):
+    """Dump the UI and return the parsed XML root, or None."""
+    import xml.etree.ElementTree as ET
+    xml_str = ui_dump(ip)
+    if not xml_str:
+        return None
+    try:
+        return ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+
+
+def _rid(node) -> str:
+    return node.get("resource-id", "").split("/")[-1]
+
+
+def _focused_texts(root, rid: str) -> list[str]:
+    """Texts with the given resource-id inside the focused node."""
+    for node in root.iter("node"):
+        if node.get("focused") == "true":
+            return [n.get("text", "") for n in node.iter("node") if _rid(n) == rid]
+    return []
+
+
+def _move_focus_to(ip: str, rid: str, target_index, axis: str = "horizontal",
+                   max_rounds: int = 4) -> bool:
+    """Move D-pad focus until the focused item is the target among items with `rid`.
+
+    `target_index(texts)` returns the wanted index in the list of all texts with
+    `rid` (document order). Each round reads the UI, presses the arrow key the
+    needed number of times, and re-checks, so slow UIs self-correct.
+    """
+    prev_key, next_key = ("left", "right") if axis == "horizontal" else ("up", "down")
+    for _ in range(max_rounds):
+        root = _ui_root(ip)
+        if root is None:
+            return False
+        texts = [n.get("text", "") for n in root.iter("node") if _rid(n) == rid]
+        focused = _focused_texts(root, rid)
+        want = target_index(texts)
+        if want is None:
+            return False
+        if not focused or focused[0] not in texts:
+            return False
+        delta = want - texts.index(focused[0])
+        if delta == 0:
+            return True
+        for _ in range(abs(delta)):
+            key(ip, next_key if delta > 0 else prev_key)
+            wait(NAV_DELAY)
+        wait(NAV_DELAY)
+    return False
+
+
+def _clean_result_title(title: str) -> str:
+    """'EN - Below Deck Adventure (2022) (US)' → 'Below Deck Adventure'."""
+    title = re.sub(r"^[A-Z]{2,3}\s*[-|]\s*", "", title)
+    return re.sub(r"\s*\([^)]*\)", "", title).strip()
+
+
+def select_matching_result(ip: str, query: str) -> str | None:
+    """Select the search result whose title best matches `query` and open it.
+
+    Uses _fuzzy_match on the result titles (exact > starts-with > contains,
+    shorter preferred), so 'below deck' picks 'Below Deck' and not the first
+    tile 'Below Deck Mediterranean'. Returns the chosen title, or None.
+    """
+    rid = "stream_search_result_title"
+
+    def target(texts):
+        candidates = [{"title": _clean_result_title(t), "index": i} for i, t in enumerate(texts)]
+        matches = _fuzzy_match(query, candidates)
+        return matches[0]["index"] if matches else None
+
+    # Focus starts on the category tabs; move down into the results row
+    root = _ui_root(ip)
+    for _ in range(2):
+        if root is not None and _focused_texts(root, rid):
+            break
+        key(ip, "down")
+        wait(NAV_DELAY * 2)
+        root = _ui_root(ip)
+    if root is None or not _focused_texts(root, rid):
+        return None
+
+    if not _move_focus_to(ip, rid, target):
+        return None
+    chosen = _focused_texts(_ui_root(ip), rid)
+    key(ip, "ok")
+    wait(LOAD_DELAY)
+    return chosen[0] if chosen else None
+
+
+_ALL_EPISODES_LABELS = ("alle afleveringen", "all episodes", "tous les episodes",
+                        "alle folgen", "todos los episodios", "tutti gli episodi")
+
+
+def open_all_episodes(ip: str) -> bool:
+    """On a series detail page, focus the 'All episodes' action and press OK.
+
+    The focused action differs per firmware and watch state (e.g. 'Doorgaan',
+    or the trailer 'Voorbeeld' row), so the label is looked up instead of
+    pressing OK on whatever happens to be focused.
+    """
+    rid = "detail_overview_action_label"
+
+    def target(texts):
+        for i, t in enumerate(texts):
+            if _normalize(t) in _ALL_EPISODES_LABELS:
+                return i
+        return None
+
+    # Focus may sit below the action row (e.g. on the trailer); move up into it
+    for _ in range(4):
+        root = _ui_root(ip)
+        if root is None:
+            return False
+        if _focused_texts(root, rid):
+            break
+        key(ip, "up")
+        wait(NAV_DELAY * 2)
+    else:
+        return False
+
+    if not _move_focus_to(ip, rid, target):
+        return False
+    key(ip, "ok")
+    wait(LOAD_DELAY)
+    return True
+
+
+def _episode_number(breadcrumb: str) -> tuple[int, int] | None:
+    """'S1:A3' / 'S1:E3' → (1, 3)."""
+    m = re.match(r"S(\d+)\s*[:.]\s*\D*(\d+)", breadcrumb)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def select_episode(ip: str, season: int, episode: int) -> bool:
+    """In the episode browser, pick season (by position) and episode (by breadcrumb)."""
+    if not _move_focus_to(ip, "season_name", lambda texts: season - 1 if season <= len(texts) else None,
+                          axis="vertical"):
+        return False
+    wait(LOAD_DELAY * 0.5)
+    key(ip, "right")  # into the episode list, E1 focused
+    wait(NAV_DELAY * 2)
+
+    for _ in range(episode + 2):
+        root = _ui_root(ip)
+        focused = _focused_texts(root, "series_episode_breadcrumb") if root is not None else []
+        parsed = _episode_number(focused[0]) if focused else None
+        if parsed is None:
+            return False
+        if parsed[1] == episode:
+            return True
+        # Episode list is virtualized, so step and re-check instead of jumping
+        steps = episode - parsed[1]
+        for _ in range(abs(steps)):
+            key(ip, "down" if steps > 0 else "up")
+            wait(NAV_DELAY)
+        wait(NAV_DELAY * 2)
+    return False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -820,10 +1001,11 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
     2. Build deeplink with target season/episode using stalker:// URL
     3. Fire deeplink with channel_type=2 (series history) → auto-plays
 
-    Fallback (slow path — UI navigation):
-    1. Search → select series → "Tous les épisodes" (auto-focused) → OK
-    2. Episode browser: seasons left, episodes right
-    3. Down×(S-1) for season, Right, Down×(E-1) for episode, OK to play
+    Fallback (slow path — UI navigation, verified with UI dumps at each step):
+    1. Search → focus the result whose title best matches the query → OK
+    2. Detail page: focus the "All episodes" action by label → OK
+    3. Episode browser: seasons left, episodes right; navigate until the
+       focused breadcrumb reads S{season}:A{episode}, then OK to play
     """
     label = f"'{query}' S{season:02d}E{episode:02d}"
 
@@ -853,35 +1035,26 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
 
     # Slow path: UI-based search
     do_search(ip, query, section="series")
-    select_first_result(ip)
+    title = select_matching_result(ip, query)
+    if not title:
+        output_err(f"No series result matching '{query}'")
+        return
 
-    # Detail page: "Tous les épisodes" is auto-focused → press OK
     wait(LOAD_DELAY * 0.5)
-    key(ip, "ok")
-    wait(LOAD_DELAY)
+    if not open_all_episodes(ip):
+        output_err(f"Could not open the episode list for '{title}'")
+        return
 
-    # Episode browser: seasons on left (Season 1 selected), episodes on right
-    if season > 1:
-        for _ in range(season - 1):
-            key(ip, "down")
-            wait(NAV_DELAY * 1.2)
-        wait(NAV_DELAY * 2)
-
-    # Move right to episode list
-    key(ip, "right")
-    wait(NAV_DELAY)
-
-    # Navigate to correct episode (E1 is focused by default)
-    if episode > 1:
-        for _ in range(episode - 1):
-            key(ip, "down")
-            wait(NAV_DELAY * 1.2)
+    if not select_episode(ip, season, episode):
+        output_err(f"Episode S{season:02d}E{episode:02d} not found for '{title}'")
+        return
 
     # Play
     key(ip, "ok")
     wait(LOAD_DELAY * 0.5)
+    label = f"'{_clean_result_title(title)}' S{season:02d}E{episode:02d}"
     output_ok(f"Playing {label}", {
-        "query": query, "season": season, "episode": episode, "method": "search"
+        "query": query, "title": title, "season": season, "episode": episode, "method": "search"
     })
     _notify("Formuler Remote", f"Playing: {label}")
 
