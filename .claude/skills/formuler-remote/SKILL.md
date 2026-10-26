@@ -35,6 +35,8 @@ Uses direct deeplinks via the Android content provider for instant VOD/series pl
 | Play series episode | `formuler-remote --json --first play-series "breaking bad" 2 3` |
 | Search channels | `formuler-remote --json search france` |
 | List all channels | `formuler-remote --json list-all` |
+| All live channels of a country | `formuler-remote --json country be` (codes: `nl be us ca au nz`) |
+| Tune by provider id | `formuler-remote --json tune-id 2_1451_811983_0` |
 | Channel info | `formuler-remote --json channel-info 42` |
 | Device status | `formuler-remote --json status` |
 | Ping device | `formuler-remote --json ping` |

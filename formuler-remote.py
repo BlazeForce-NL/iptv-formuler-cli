@@ -207,6 +207,18 @@ SEARCH_PREFIXES = (
     + ["|BE|", "|FR|", "|NL|", "|UK|", "|US|", "|DE|", "|ES|", "|IT|", "|PT|"]
 )
 
+# Country code -> (display name, title prefixes the provider uses, e.g. "NL| NPO1 4K").
+# Extend via [countries] in config: be = ["België", ["BE"]]
+COUNTRIES = {
+    "nl": ("Nederland", ["NL"]),
+    "be": ("België", ["BE"]),
+    "us": ("USA", ["U.S", "US"]),
+    "ca": ("Canada", ["CA"]),
+    "au": ("Australië", ["AU"]),
+    "nz": ("Nieuw-Zeeland", ["NZ"]),
+}
+COUNTRIES.update({k.lower(): (v[0], list(v[1])) for k, v in CONFIG.get("countries", {}).items()})
+
 
 # ──────────────────────── Fuzzy Matching ────────────────────────
 
@@ -284,6 +296,8 @@ COMMANDS = {
     "list": {"args": "[filter]", "desc": "List channels from favorites/history cache"},
     "list-all": {"args": "[filter]", "desc": "List all enumerated channels (requires refresh-all first)"},
     "channel-info": {"args": "<number>", "desc": "Show details for a channel number"},
+    "country": {"args": "[code] [filter]", "desc": "List countries, or all live channels of one (e.g. 'country be')"},
+    "tune-id": {"args": "<unique_id>", "desc": "Tune a channel by its provider id (from 'country --json')"},
     "last": {"args": "", "desc": "Retune the last tuned channel"},
     "prev": {"args": "", "desc": "Swap to previous channel (recall)"},
     "tune-history": {"args": "[count]", "desc": "Show recent tune history with timestamps"},
@@ -1162,11 +1176,16 @@ def fetch_channels(ip: str) -> list[dict]:
     return channels
 
 
-def search_provider(ip: str, query: str) -> list[dict]:
+def search_provider(ip: str, query: str, limit: int | None = None) -> list[dict]:
+    """Query MyTVOnline's search provider. It returns 10 rows unless `limit` is given."""
+    uri = f"content://tv.formuler.mol3.real.searchProvider/search_suggest_query/{query}"
+    if limit:
+        uri += f"?limit={limit}"
+    # The device shell re-parses the command line: quote so '|' and spaces stay in the URI
     code, out = _adb_retry(
         ip, "shell", "content", "query",
-        "--uri", f"content://tv.formuler.mol3.real.searchProvider/search_suggest_query/{query}",
-        timeout=15
+        "--uri", "'" + uri.replace("'", "'\\''") + "'",
+        timeout=30 if limit else 15
     )
     if code != 0:
         return []
@@ -1237,6 +1256,88 @@ def get_full_channels(ip: str, force_refresh: bool = False) -> list[dict]:
             json.dump(channels, f, indent=2, ensure_ascii=False)
         info(f"Cached {len(channels)} channels")
     return channels
+
+
+def _channel_kind(title: str) -> str:
+    t = title.upper()
+    if "RADIO" in t:
+        return "radio"
+    if "24/7" in t:
+        return "24/7"
+    if "PPV" in t or "EVENT" in t:
+        return "events"
+    return "tv"
+
+
+def country_channels(ip: str, code: str, force_refresh: bool = False) -> list[dict]:
+    """All live channels of one country, read from the search provider in one query per prefix."""
+    code = code.lower()
+    if code not in COUNTRIES:
+        return []
+    cache = CACHE_DIR / f"country_{code}.json"
+    max_age = CONFIG.get("cache", {}).get("channels_max_age_hours", 24)
+    if not force_refresh and cache.exists() and (time.time() - cache.stat().st_mtime) / 3600 < max_age:
+        with open(cache, encoding="utf-8") as f:
+            return json.load(f)
+
+    seen: set[str] = set()
+    channels: list[dict] = []
+    for prefix in COUNTRIES[code][1]:
+        own = re.compile(rf"^{re.escape(prefix)}\s*\|\s*", re.I)  # search matches anywhere in the title
+        for r in search_provider(ip, f"{prefix}|", limit=20000):
+            uid = r.get("unique_id")
+            if uid and uid not in seen and own.match(r.get("title", "")):
+                seen.add(uid)
+                channels.append({**r, "kind": _channel_kind(r["title"])})
+    channels.sort(key=lambda c: int(c["number"]) if (c.get("number") or "").isdigit() else 1 << 30)
+    if channels:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(channels, f, indent=2, ensure_ascii=False)
+    return channels
+
+
+def cmd_country(ip: str, code: str = "", filter_text: str = ""):
+    if not code:
+        rows = [{"code": k, "name": v[0], "prefixes": v[1]} for k, v in COUNTRIES.items()]
+        if JSON_MODE:
+            output(rows)
+            return
+        for r in rows:
+            print(f"  {r['code']:<4} {r['name']}  ({', '.join(p + '|' for p in r['prefixes'])})")
+        return
+    if code.lower() not in COUNTRIES:
+        error(f"Unknown country '{code}'. Known: {', '.join(COUNTRIES)}")
+        return
+    channels = country_channels(ip, code)
+    if filter_text:
+        channels = _fuzzy_match(filter_text, channels)
+    if JSON_MODE:
+        output(channels)
+        return
+    for ch in channels:
+        print(f"  {ch.get('number') or '':>6}. {ch['title']}")
+    print(f"\n  {_C.DIM}{COUNTRIES[code.lower()][0]}: {len(channels)} channels{_C.RESET}")
+
+
+def cmd_tune_id(ip: str, unique_id: str):
+    """Tune a channel by its provider unique id (as listed by 'country')."""
+    if not re.fullmatch(r"[\w.-]+", unique_id):
+        error(f"Invalid channel id '{unique_id}'")
+        return
+    ch = {"title": unique_id, "unique_id": unique_id}
+    for path in [FULL_CHANNELS_CACHE, *CACHE_DIR.glob("country_*.json")]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                hit = next((c for c in json.load(f) if c.get("unique_id") == unique_id), None)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if hit:
+            ch = hit
+            break
+    output_ok(f"Tuning to: {ch['title']}", ch)
+    _record_tune(ch)
+    _tune_by_uid(ip, unique_id)
 
 
 def channel_by_number(ip: str, number: str) -> dict | None:
@@ -2476,6 +2577,8 @@ HELP_TEXT = f"""
     list [filter]                   list channels (e.g. 'list BE')
     list-all [filter]               list all enumerated channels
     channel-info <number>           show channel details
+    country [code] [filter]         countries, or one country's channels (nl be us ca au nz)
+    tune-id <unique_id>             tune by provider channel id
     categories                      show category counts
 
   {_C.CYAN}VOD (Movies){_C.RESET}
@@ -2626,6 +2729,10 @@ def dispatch(ip: str, raw: str) -> bool:
         cmd_list_all(ip, atxt)
     elif cmd == "channel-info" and args:
         cmd_channel_info(ip, args[0])
+    elif cmd == "country":
+        cmd_country(ip, args[0] if args else "", " ".join(args[1:]))
+    elif cmd == "tune-id" and args:
+        cmd_tune_id(ip, args[0])
     elif cmd == "categories":
         cmd_categories(ip)
     elif cmd == "refresh":
@@ -2804,7 +2911,7 @@ def dispatch_chain(ip: str, raw: str) -> bool:
 # Commands the web page may run (first word of each ';' part). Long-running or
 # destructive ones (serve, reboot, watch, record) are left out on purpose.
 _WEB_ALLOWED = {
-    "tune", "last", "prev", "channel", "section", "play-movie", "play-series", "resume",
+    "tune", "tune-id", "last", "prev", "channel", "section", "play-movie", "play-series", "resume",
     "open", "mirror", "screenshot", "status", "ping", "wake", "power-off", "sleep-timer",
     "sleep-at", "sleep-cancel", "epg", "guide", "star", "stop-vod", "cec", "wait", "type",
 }
@@ -2922,15 +3029,10 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             return None
         return proc.stdout if proc.returncode == 0 and proc.stdout[:4] == b"\x89PNG" else None
 
-    def channels() -> list[dict]:
-        try:
-            with open(FULL_CHANNELS_CACHE, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-        out = [{"number": c.get("number", ""), "title": c.get("title", ""), "logo": c.get("logo", "")}
-               for c in data]
-        return sorted(out, key=lambda c: int(c["number"]) if str(c["number"]).isdigit() else 1 << 30)
+    def channels(country: str) -> list[dict]:
+        return [{"number": c.get("number") or "", "title": c.get("title", ""), "logo": c.get("logo") or "",
+                 "id": c["unique_id"], "kind": c.get("kind", "tv")}
+                for c in country_channels(ip, country)]
 
     # ── Live stream to the browser ──
     # scrcpy (no window) records the box's screen + audio to a growing MKV; ffmpeg
@@ -3102,8 +3204,13 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             path = urlparse(self.path).path
             if path == "/":
                 self._send(200, WEB_REMOTE_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/api/countries":
+                self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()]})
             elif path == "/api/channels":
-                self._json({"ok": True, "channels": channels()})
+                country = (parse_qs(urlparse(self.path).query).get("country") or ["nl"])[0].lower()
+                if country not in COUNTRIES:
+                    return self._json({"ok": False, "error": f"Unknown country '{country}'"}, 400)
+                self._json({"ok": True, "country": country, "channels": channels(country)})
             elif path == "/api/status":
                 self._json(status())
             elif path == "/api/screenshot":
@@ -3196,8 +3303,8 @@ header { position: sticky; top: 0; z-index: 5; display: flex; align-items: cente
 header h1 { font-size: 17px; margin: 0; flex: 1; }
 .pill { font-size: 12px; padding: 4px 10px; border-radius: 99px; background: var(--panel-2); color: var(--muted); }
 .pill.on { color: var(--ok); }
-main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
-@media (min-width: 900px) { main { grid-template-columns: 380px 1fr; align-items: start; } }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) { main { grid-template-columns: 380px minmax(0, 1fr); align-items: start; } }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
 section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; }
 button { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
@@ -3213,7 +3320,8 @@ button:disabled { opacity: .5; }
 .rockers { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px; }
 .rocker { display: grid; gap: 6px; }
 .rocker span { text-align: center; font-size: 12px; color: var(--muted); }
-.stack { display: grid; gap: 16px; }
+.stack { display: grid; gap: 16px; min-width: 0; }
+.stack > section { min-width: 0; }  /* let the chip rows scroll instead of widening the page */
 .preview { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16/9; }
 .preview img, .preview video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
 .preview .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
@@ -3223,6 +3331,10 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
                 border-radius: 10px; padding: 10px 12px; width: 100%; min-width: 0; }
 .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
             max-height: 360px; overflow-y: auto; margin-top: 10px; padding-right: 2px; }
+.chips { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 8px; scrollbar-width: none; }
+.chips button { flex: none; padding: 6px 12px; border-radius: 99px; font-size: 13px; }
+.chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-2); color: #fff; }
+.chips button[hidden] { display: none; }
 .ch { display: grid; gap: 4px; justify-items: center; padding: 8px 6px; font-size: 12px; }
 .ch img { width: 56px; height: 34px; object-fit: contain; }
 .ch .num { color: var(--muted); font-size: 11px; }
@@ -3311,7 +3423,13 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 
     <section aria-label="Channels">
       <h2>Channels</h2>
-      <input id="filter" type="search" placeholder="Filter channels (e.g. NL, NPO, sport)" autocomplete="off">
+      <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
+      <div id="kinds" class="chips" aria-label="Type">
+        <button data-kind="" aria-pressed="true">All</button><button data-kind="tv" aria-pressed="false">TV</button>
+        <button data-kind="24/7" aria-pressed="false">24/7</button><button data-kind="events" aria-pressed="false">Events</button>
+        <button data-kind="radio" aria-pressed="false">Radio</button>
+      </div>
+      <input id="filter" type="search" placeholder="Filter channels (e.g. NPO, sport, 42)" autocomplete="off">
       <div id="channels" class="channels"></div>
       <p id="ch-hint" class="hint"></p>
     </section>
@@ -3389,29 +3507,60 @@ $("#auto").onchange = (e) => {
   clearInterval(autoTimer);
   if (e.target.checked) { refreshShot(); autoTimer = setInterval(refreshShot, 5000); }
 };
-let allChannels = [];
+let allChannels = [], country = "nl", kind = "";
+try { country = localStorage.getItem("country") || "nl"; } catch (e) {}
 function renderChannels() {
   const q = $("#filter").value.trim().toLowerCase();
-  const list = allChannels.filter(c => !q || c.title.toLowerCase().includes(q) || String(c.number) === q);
+  const list = allChannels.filter(c => (!kind || c.kind === kind)
+    && (!q || c.title.toLowerCase().includes(q) || String(c.number) === q));
   const box = $("#channels"); box.innerHTML = "";
-  for (const c of list.slice(0, 200)) {
+  for (const c of list.slice(0, 300)) {
     const b = document.createElement("button");
-    b.className = "ch"; b.dataset.cmd = "tune " + c.number; b.title = c.title;
-    const name = c.title.replace(/^[A-Z]{2,3}\s*\|\s*/, "").replace(/\s+(4K|UHD|FHD|HD)$/i, "");
+    b.className = "ch"; b.dataset.cmd = "tune-id " + c.id; b.title = c.title;
+    const name = c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "").replace(/\s+(4K|UHD|FHD|HD)$/i, "");
     if (c.logo) { const i = document.createElement("img"); i.src = c.logo; i.alt = ""; i.loading = "lazy";
                   i.onerror = () => i.remove(); b.append(i); }
     const n = document.createElement("span"); n.className = "num"; n.textContent = c.number;
     const t = document.createElement("span"); t.className = "name"; t.textContent = name;
     b.append(n, t); box.append(b);
   }
-  $("#ch-hint").textContent = allChannels.length ? `${list.length} of ${allChannels.length} channels`
-    : "No channel list yet. Run 'formuler-remote refresh-all' once.";
+  $("#ch-hint").textContent = allChannels.length
+    ? `${list.length} of ${allChannels.length} channels` + (list.length > 300 ? " (first 300 shown, filter to narrow)" : "")
+    : "No channels found for this country.";
+  for (const k of $("#kinds").children) k.hidden = !!k.dataset.kind && !allChannels.some(c => c.kind === k.dataset.kind);
 }
 $("#filter").oninput = renderChannels;
+$("#kinds").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  kind = b.dataset.kind;
+  for (const k of $("#kinds").children) k.setAttribute("aria-pressed", String(k === b));
+  renderChannels();
+};
 async function loadChannels() {
-  const r = await api("/api/channels");
-  allChannels = r.channels || []; renderChannels();
+  for (const b of $("#countries").children) b.setAttribute("aria-pressed", String(b.dataset.country === country));
+  $("#channels").innerHTML = ""; $("#ch-hint").textContent = "Loading channels…";
+  const r = await api("/api/channels?country=" + encodeURIComponent(country));
+  if (!r.ok) { $("#ch-hint").textContent = r.error || "Could not load channels"; return; }
+  allChannels = r.channels || [];
+  if (kind && !allChannels.some(c => c.kind === kind)) $("#kinds").children[0].click();
+  else renderChannels();
 }
+async function loadCountries() {
+  const r = await api("/api/countries");
+  const list = r.countries || [];
+  if (!list.some(c => c.code === country)) country = list[0]?.code || "nl";
+  $("#countries").replaceChildren(...list.map(c => {
+    const b = document.createElement("button");
+    b.dataset.country = c.code; b.textContent = c.name; return b;
+  }));
+  await loadChannels();
+}
+$("#countries").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b || b.dataset.country === country) return;
+  country = b.dataset.country;
+  try { localStorage.setItem("country", country); } catch (err) {}
+  loadChannels();
+};
 $("#play").onclick = () => {
   const title = $("#title").value.trim();
   if (!title) return toast("Enter a title", true);
@@ -3478,7 +3627,7 @@ async function refreshState() {
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }
-loadChannels(); refreshState(); setInterval(refreshState, 10000);
+loadCountries(); refreshState(); setInterval(refreshState, 10000);
 </script>
 </body>
 </html>
@@ -3491,7 +3640,7 @@ loadChannels(); refreshState(); setInterval(refreshState, 10000);
 
 def _make_completer(ip: str):
     commands = [
-        "tune", "search", "list", "list-all", "channel-info", "categories",
+        "tune", "search", "list", "list-all", "channel-info", "country", "tune-id", "categories",
         "section", "browse", "channel",
         "search-vod", "play-movie", "stop-vod",
         "search-series", "play-series", "episodes",
