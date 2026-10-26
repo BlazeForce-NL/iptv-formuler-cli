@@ -49,6 +49,8 @@ Uses direct deeplinks via the Android content provider for instant VOD/series pl
 | Sleep at time | `formuler-remote --json sleep-at 23:30` |
 | Cancel sleep | `formuler-remote --json sleep-cancel` |
 | Export M3U | `formuler-remote --json export-m3u channels.m3u` |
+| Mirror screen to this computer (audio here, TV muted) | `formuler-remote --json mirror` |
+| Mirror screen, sound stays on TV | `formuler-remote --json mirror --no-audio` |
 | Watch screenshots | `formuler-remote --json watch 5 /tmp` |
 | Chain commands | `formuler-remote --json --first 'tune TF1 ; wait 5 ; screenshot'` |
 | List commands | `formuler-remote --json commands` |

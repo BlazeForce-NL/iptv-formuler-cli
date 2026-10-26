@@ -30,6 +30,7 @@ Single-file Python script, zero dependencies beyond stdlib. Control your Formule
 - **Dry-run mode** — preview ADB commands without executing
 - **CEC control** — power TV on/off through the Formuler box
 - **Screen capture** — screenshots and screen recording
+- **Screen mirroring** — live view of the box on your computer via [scrcpy](https://github.com/Genymobile/scrcpy), with audio here or on the TV
 - **M3U export** — export channel lineup as M3U playlist
 - **Shell completions** — bash, zsh, and fish completion scripts
 - **Configurable timing** — tune navigation delays for your device speed
@@ -172,6 +173,12 @@ formuler-remote wake                      # CEC wakeup + launch MyTV
 formuler-remote power-off                 # CEC sleep + disconnect
 formuler-remote ping                      # check device connectivity
 formuler-remote export-m3u channels.m3u   # export channel lineup
+
+# Screen mirroring (needs scrcpy: winget install Genymobile.scrcpy / brew install scrcpy)
+formuler-remote mirror                    # video + audio on this computer
+formuler-remote mirror --no-audio         # video here, sound stays on the TV
+formuler-remote mirror --fullscreen       # start fullscreen
+# On Android 11 (Z11 Pro MAX) audio forwarding mutes the TV; closing the window restores it.
 ```
 
 ### Interactive Mode

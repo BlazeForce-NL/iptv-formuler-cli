@@ -323,6 +323,7 @@ COMMANDS = {
     "repeat": {"args": "<key> <count>", "desc": "Press a key N times"},
     "cec": {"args": "<on|off|standby>", "desc": "TV power control via CEC pass-through"},
     "record": {"args": "[duration] [path]", "desc": "Screen record (default 30s)"},
+    "mirror": {"args": "[--no-audio] [--fullscreen]", "desc": "Mirror screen to this computer via scrcpy (audio here; --no-audio keeps sound on the TV)"},
     # General
     "type": {"args": "<text>", "desc": "Type text on device keyboard"},
     "key": {"args": "<keyname>", "desc": "Send a single key event"},
@@ -2114,6 +2115,72 @@ def cmd_record_screen(ip: str, duration: int = 30, path: str = str(TMP_DIR / "fo
         output_ok(f"Recording saved to {path}", {"path": path})
 
 
+_keep_connection = False  # set when a command (mirror) still needs the ADB connection after exit
+
+
+def _find_scrcpy() -> str | None:
+    found = shutil.which("scrcpy")
+    if found or os.name != "nt":
+        return found
+    # winget adds the alias to PATH only for new shells; look in its package dir
+    pkgs = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    for exe in sorted(pkgs.glob("Genymobile.scrcpy*/scrcpy-*/scrcpy.exe"), reverse=True):
+        return str(exe)
+    return None
+
+
+def cmd_mirror(ip: str, tv_audio: bool = False, fullscreen: bool = False):
+    """Mirror the device screen to this computer with scrcpy.
+
+    By default audio is forwarded to this computer. On Android 11 (Z11 Pro MAX)
+    capturing audio mutes the TV, since --audio-dup needs Android 13, so
+    tv_audio=True mirrors video only and keeps the sound on the TV.
+    """
+    global _keep_connection
+    exe = _find_scrcpy()
+    if not exe:
+        hint = "winget install Genymobile.scrcpy" if os.name == "nt" else "https://github.com/Genymobile/scrcpy"
+        output_err(f"scrcpy not found. Install it: {hint}")
+        return
+
+    args = [exe, "--serial", tgt(ip), "--window-title", "Formuler", "--max-size", "1920",
+            "--video-bit-rate", "12M", "--no-power-on"]
+    if tv_audio:
+        args.append("--no-audio")
+    if fullscreen:
+        args.append("--fullscreen")
+
+    # Use the same adb as this CLI: two adb versions kill each other's server
+    env = dict(os.environ)
+    if shutil.which("adb"):
+        env["ADB"] = shutil.which("adb")
+
+    log_path = TMP_DIR / "formuler-mirror.log"
+    if DRY_RUN:
+        print(f"[dry-run] {' '.join(args)}", file=sys.stderr)
+        return
+    log = open(log_path, "w", encoding="utf-8")
+    # Detach so the window outlives this command
+    if os.name == "nt":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
+    else:
+        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+
+    # scrcpy exits within a few seconds when it can't start (device, codec, options)
+    time.sleep(4)
+    if proc.poll() is not None:
+        log.close()
+        tail = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-3:]
+        output_err(f"scrcpy exited: {' | '.join(tail)}", {"log": str(log_path)})
+        return
+
+    _keep_connection = True
+    audio = "on the TV" if tv_audio else "on this computer (TV is muted while mirroring)"
+    output_ok(f"Mirroring started, audio {audio}. Close the window to stop.",
+              {"pid": proc.pid, "tv_audio": tv_audio, "log": str(log_path)})
+
+
 # ══════════════════════════════════════════════════════════════
 #  CONVENIENCE COMMANDS
 # ══════════════════════════════════════════════════════════════
@@ -2320,6 +2387,8 @@ HELP_TEXT = f"""
     repeat <key> <count>            press key N times
     cec <on|off|standby>            TV power via CEC
     record [duration] [path]        screen record (default 30s)
+    mirror [--no-audio] [--fullscreen]
+                                    mirror screen here via scrcpy (--no-audio: sound stays on TV)
 
   {_C.CYAN}EXPORT{_C.RESET}
     export-m3u [path]               export channel lineup as M3U file
@@ -2506,6 +2575,10 @@ def dispatch(ip: str, raw: str) -> bool:
         dur = int(args[0]) if args and args[0].isdigit() else 30
         path = args[1] if len(args) > 1 else str(TMP_DIR / "formuler-recording.mp4")
         cmd_record_screen(ip, dur, path)
+    elif cmd == "mirror":
+        opts = {a.lower().lstrip("-") for a in args}
+        cmd_mirror(ip, tv_audio=bool(opts & {"no-audio", "tv-audio", "tv"}),
+                   fullscreen=bool(opts & {"fullscreen", "fs"}))
 
     # Text / direct key
     elif cmd == "type" and args:
@@ -2703,8 +2776,9 @@ def interactive(ip: str):
     for t in _timers:
         t["timer"].cancel()
 
-    run_adb("disconnect", tgt(ip))
-    info("Disconnected.")
+    if not _keep_connection:
+        run_adb("disconnect", tgt(ip))
+        info("Disconnected.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2846,7 +2920,8 @@ def main():
                 dispatch_chain(ip, line)
                 if post_wait > 0:
                     time.sleep(post_wait)
-            run_adb("disconnect", tgt(ip))
+            if not _keep_connection:
+                run_adb("disconnect", tgt(ip))
             sys.exit(_exit_code)
         else:
             interactive(ip)
@@ -2856,7 +2931,8 @@ def main():
     dispatch_chain(ip, cmd_str)
     if post_wait > 0:
         time.sleep(post_wait)
-    run_adb("disconnect", tgt(ip))
+    if not _keep_connection:  # mirror keeps using the connection after we exit
+        run_adb("disconnect", tgt(ip))
     sys.exit(_exit_code)
 
 
