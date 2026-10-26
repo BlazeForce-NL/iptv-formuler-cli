@@ -3568,7 +3568,7 @@ function renderChannels() {
   }
   const total = groups.filter(g => !kind || g[0].kind === kind).length;
   $("#ch-hint").textContent = allChannels.length
-    ? `${list.length} of ${total} channels` + (all ? "" : ` (${allChannels.length} incl. variants)`)
+    ? `${list.length} of ${total} channels` + (all ? "" : ` (${allChannels.filter(c => !kind || c.kind === kind).length} incl. variants)`)
       + (list.length > 300 ? ", first 300 shown, filter to narrow" : "")
     : "No channels found for this country.";
   for (const k of $("#kinds").children) k.hidden = !!k.dataset.kind && !allChannels.some(c => c.kind === k.dataset.kind);
