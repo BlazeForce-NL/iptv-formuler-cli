@@ -31,6 +31,8 @@ Single-file Python script, zero dependencies beyond stdlib. Control your Formule
 - **CEC control** — power TV on/off through the Formuler box
 - **Screen capture** — screenshots and screen recording
 - **Screen mirroring** — live view of the box on your computer via [scrcpy](https://github.com/Genymobile/scrcpy), with audio here or on the TV
+- **Web remote** — `serve` gives a token-protected remote control page for phone/tablet on your network
+- **Playback check** — `play-movie`/`play-series` only report success once the player is actually playing
 - **M3U export** — export channel lineup as M3U playlist
 - **Shell completions** — bash, zsh, and fish completion scripts
 - **Configurable timing** — tune navigation delays for your device speed
@@ -180,6 +182,23 @@ formuler-remote mirror --no-audio         # video here, sound stays on the TV
 formuler-remote mirror --fullscreen       # start fullscreen
 # On Android 11 (Z11 Pro MAX) audio forwarding mutes the TV; closing the window restores it.
 ```
+
+### Web Remote
+
+Control the box from a phone, tablet or browser on the same network:
+
+```bash
+formuler-remote serve            # LAN, port 8765
+formuler-remote serve 9000       # other port
+formuler-remote serve --local    # only this computer (127.0.0.1)
+```
+
+It prints a link like `http://192.168.0.185:8765/?t=…`. Open it on your phone and bookmark it. The page has a D-pad, volume/channel keys, app buttons (MyTVOnline, YouTube, Prime Video), a channel grid with logos (from `refresh-all`), a play form for series/movies, mirror buttons and a screen preview. Arrow keys, Enter, Backspace, `+`/`-` and PageUp/PageDown work on a keyboard too.
+
+- **Access token:** every request needs the token in the link. It is stored in `~/.cache/formuler-remote/web_token` so bookmarks survive restarts; delete that file to revoke old links.
+- **Allowed commands:** the page can only run remote-control commands (tune, play, open, mirror, …), not `reboot`, `serve`, `watch` or `record`.
+- **Speed:** key presses go through one persistent `adb shell`; other commands run one at a time through the CLI.
+- **Windows:** allow Python through the firewall for private networks when asked, otherwise the phone can't connect.
 
 ### Interactive Mode
 

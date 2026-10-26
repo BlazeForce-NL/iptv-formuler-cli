@@ -325,6 +325,7 @@ COMMANDS = {
     "cec": {"args": "<on|off|standby>", "desc": "TV power control via CEC pass-through"},
     "record": {"args": "[duration] [path]", "desc": "Screen record (default 30s)"},
     "mirror": {"args": "[--no-audio] [--fullscreen]", "desc": "Mirror screen to this computer via scrcpy (audio here; --no-audio keeps sound on the TV)"},
+    "serve": {"args": "[port] [--local]", "desc": "Start the web remote (default port 8765, LAN; --local binds to this computer only)"},
     # General
     "type": {"args": "<text>", "desc": "Type text on device keyboard"},
     "key": {"args": "<keyname>", "desc": "Send a single key event"},
@@ -2233,8 +2234,8 @@ def _mirror_running() -> bool:
 
 
 def _disconnect(ip: str):
-    """Disconnect ADB unless a mirror (this run or an earlier one) still uses it."""
-    if _keep_connection or _mirror_running():
+    """Disconnect ADB unless a mirror or the web remote server still uses it."""
+    if _keep_connection or os.environ.get("FORMULER_KEEP_CONNECTION") or _mirror_running():
         return
     run_adb("disconnect", tgt(ip))
 
@@ -2520,6 +2521,7 @@ HELP_TEXT = f"""
     record [duration] [path]        screen record (default 30s)
     mirror [--no-audio] [--fullscreen]
                                     mirror screen here via scrcpy (--no-audio: sound stays on TV)
+    serve [port] [--local]          web remote for phone/tablet/laptop (default port 8765)
 
   {_C.CYAN}EXPORT{_C.RESET}
     export-m3u [path]               export channel lineup as M3U file
@@ -2710,6 +2712,9 @@ def dispatch(ip: str, raw: str) -> bool:
         opts = {a.lower().lstrip("-") for a in args}
         cmd_mirror(ip, tv_audio=bool(opts & {"no-audio", "tv-audio", "tv"}),
                    fullscreen=bool(opts & {"fullscreen", "fs"}))
+    elif cmd == "serve":
+        port = next((int(a) for a in args if a.isdigit()), 8765)
+        cmd_serve(ip, port=port, local_only="--local" in args)
 
     # Text / direct key
     elif cmd == "type" and args:
@@ -2790,6 +2795,486 @@ def dispatch_chain(ip: str, raw: str) -> bool:
         elif not dispatch(ip, part):
             return False
     return True
+
+
+# ══════════════════════════════════════════════════════════════
+#  WEB REMOTE
+# ══════════════════════════════════════════════════════════════
+
+# Commands the web page may run (first word of each ';' part). Long-running or
+# destructive ones (serve, reboot, watch, record) are left out on purpose.
+_WEB_ALLOWED = {
+    "tune", "last", "prev", "channel", "section", "play-movie", "play-series", "resume",
+    "open", "mirror", "screenshot", "status", "ping", "wake", "power-off", "sleep-timer",
+    "sleep-at", "sleep-cancel", "epg", "guide", "star", "stop-vod", "cec", "wait", "type",
+}
+
+_WEB_KEYS = {"up", "down", "left", "right", "ok", "back", "home", "menu", "info", "guide",
+             "volume-up", "volume-down", "mute", "channel-up", "channel-down",
+             "play-pause", "stop", "rewind", "fast-forward"}
+
+
+def _parse_json_stream(text: str) -> list[dict]:
+    """Parse the concatenated JSON objects the CLI prints in --json mode."""
+    decoder, objs, i = json.JSONDecoder(), [], 0
+    text = text.strip()
+    while i < len(text):
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            break
+        objs.append(obj)
+        i = end
+        while i < len(text) and text[i].isspace():
+            i += 1
+    return objs
+
+
+def _lan_ip() -> str:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # UDP connect sends nothing; picks the LAN interface
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
+    """Serve a web remote control page plus a small JSON API.
+
+    Key presses go straight to adb (fast). Other commands run through this CLI
+    in a subprocess, one at a time. Every request needs the random token that
+    is printed at startup, so others on the network can't control the TV.
+    """
+    import secrets
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    global _keep_connection
+    _keep_connection = True
+    # Persist the token so a bookmark on the phone keeps working across restarts;
+    # delete the file to revoke old links.
+    token_file = CACHE_DIR / "web_token"
+    try:
+        token = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if len(token) < 12:
+        token = secrets.token_urlsafe(12)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(token, encoding="utf-8")
+    cmd_lock = threading.Lock()
+    script = str(Path(__file__).resolve())
+    env = {**os.environ, "FORMULER_KEEP_CONNECTION": "1", "PYTHONIOENCODING": "utf-8"}
+
+    def run_cli(command: str) -> dict:
+        parts = [p.strip() for p in command.split(";") if p.strip()]
+        bad = [p.split()[0] for p in parts if p.split()[0].lower() not in _WEB_ALLOWED]
+        if not parts or bad:
+            return {"ok": False, "error": f"Not allowed: {', '.join(bad) or 'empty command'}"}
+        if not cmd_lock.acquire(timeout=1):
+            return {"ok": False, "error": "Busy with another command", "busy": True}
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, "--json", "--first", ip, command],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=300, env=env)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "Command timed out"}
+        finally:
+            cmd_lock.release()
+        results = _parse_json_stream(proc.stdout)
+        errors = [r.get("error") for r in results if not r.get("ok", True)]
+        messages = [r.get("message") for r in results if r.get("message")]
+        return {"ok": proc.returncode == 0 and not errors, "messages": messages,
+                "error": "; ".join(e for e in errors if e) or None, "results": results}
+
+    # One long-lived `adb shell` for key presses: starting adb per key costs ~1s
+    key_shell: dict = {"proc": None}
+    key_lock = threading.Lock()
+
+    def press(name: str) -> dict:
+        if name not in _WEB_KEYS:
+            return {"ok": False, "error": f"Unknown key: {name}"}
+        line = f"input keyevent {KEYS[name]}\n".encode()
+        with key_lock:
+            for _ in range(2):
+                proc = key_shell["proc"]
+                if proc is None or proc.poll() is not None:
+                    proc = key_shell["proc"] = subprocess.Popen(
+                        ["adb", "-s", tgt(ip), "shell"], stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    proc.stdin.write(line)
+                    proc.stdin.flush()
+                    return {"ok": True, "error": None}
+                except OSError:
+                    key_shell["proc"] = None  # shell died (e.g. reconnect); start a new one
+        code, out = adb(ip, "shell", "input", "keyevent", str(KEYS[name]), timeout=5)
+        return {"ok": code == 0, "error": None if code == 0 else out}
+
+    def screenshot_png() -> bytes | None:
+        try:
+            proc = subprocess.run(["adb", "-s", tgt(ip), "exec-out", "screencap", "-p"],
+                                  capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return proc.stdout if proc.returncode == 0 and proc.stdout[:4] == b"\x89PNG" else None
+
+    def channels() -> list[dict]:
+        try:
+            with open(FULL_CHANNELS_CACHE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out = [{"number": c.get("number", ""), "title": c.get("title", ""), "logo": c.get("logo", "")}
+               for c in data]
+        return sorted(out, key=lambda c: int(c["number"]) if str(c["number"]).isdigit() else 1 << 30)
+
+    def status() -> dict:
+        activity = _get_current_activity(ip)
+        return {"ok": bool(activity), "activity": activity,
+                "playing": bool(_mol3_media_players(ip)), "mirror": _mirror_running()}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            if VERBOSE:
+                super().log_message(fmt, *args)
+
+        def _authorized(self) -> bool:
+            q = parse_qs(urlparse(self.path).query)
+            return secrets.compare_digest(self.headers.get("X-Token") or q.get("t", [""])[0], token)
+
+        def _send(self, status: int, body: bytes, ctype: str):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data: dict, status: int = 200):
+            self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+
+        def do_GET(self):
+            if not self._authorized():
+                return self._send(403, b"Forbidden: open the link printed by 'formuler-remote serve'",
+                                  "text/plain; charset=utf-8")
+            path = urlparse(self.path).path
+            if path == "/":
+                self._send(200, WEB_REMOTE_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/api/channels":
+                self._json({"ok": True, "channels": channels()})
+            elif path == "/api/status":
+                self._json(status())
+            elif path == "/api/screenshot":
+                png = screenshot_png()
+                if png:
+                    self._send(200, png, "image/png")
+                else:
+                    self._json({"ok": False, "error": "Screenshot failed"}, 502)
+            else:
+                self._json({"ok": False, "error": "Not found"}, 404)
+
+        def do_POST(self):
+            if not self._authorized():
+                return self._json({"ok": False, "error": "Forbidden"}, 403)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._json({"ok": False, "error": "Bad request"}, 400)
+            path = urlparse(self.path).path
+            if path == "/api/key":
+                self._json(press(str(body.get("key", ""))))
+            elif path == "/api/cmd":
+                self._json(run_cli(str(body.get("cmd", ""))))
+            else:
+                self._json({"ok": False, "error": "Not found"}, 404)
+
+    host = "127.0.0.1" if local_only else "0.0.0.0"
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        output_err(f"Cannot listen on port {port}: {e}")
+        return
+    shown = "127.0.0.1" if local_only else _lan_ip()
+    url = f"http://{shown}:{port}/?t={token}"
+    output_ok(f"Web remote running at {url} (Ctrl-C to stop)", {"url": url, "port": port})
+    if not JSON_MODE and not local_only:
+        print("Open this link on your phone or tablet (same Wi-Fi). Windows may ask to allow "
+              "Python through the firewall: allow it for private networks.")
+    sys.stdout.flush()  # the URL must show up even when output is piped to a file
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if key_shell["proc"] is not None:
+            key_shell["proc"].kill()
+        _keep_connection = False
+
+
+WEB_REMOTE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Formuler Remote</title>
+<style>
+:root {
+  --bg: #0f1115; --panel: #181b22; --panel-2: #20242d; --line: #2a2f3a;
+  --text: #e8eaf0; --muted: #8b93a7; --accent: #4f8cff; --accent-2: #2d6bea;
+  --ok: #34c77b; --err: #ff6b6b; --radius: 14px;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f3f4f7; --panel: #ffffff; --panel-2: #eef0f4; --line: #dde1e8;
+          --text: #161a22; --muted: #5d6576; }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px;
+         padding: 12px 16px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+         backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 17px; margin: 0; flex: 1; }
+.pill { font-size: 12px; padding: 4px 10px; border-radius: 99px; background: var(--panel-2); color: var(--muted); }
+.pill.on { color: var(--ok); }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+@media (min-width: 900px) { main { grid-template-columns: 380px 1fr; align-items: start; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; }
+button { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+         border-radius: 12px; padding: 12px; cursor: pointer; touch-action: manipulation; user-select: none; }
+button:active { transform: scale(.96); background: var(--line); }
+button.primary { background: var(--accent); border-color: var(--accent-2); color: #fff; }
+button:disabled { opacity: .5; }
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; }
+.dpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 300px; margin: 0 auto 12px; }
+.dpad button { aspect-ratio: 1; font-size: 22px; border-radius: 50%; }
+.dpad .ok { background: var(--accent); border-color: var(--accent-2); color: #fff; font-size: 16px; font-weight: 600; }
+.rockers { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px; }
+.rocker { display: grid; gap: 6px; }
+.rocker span { text-align: center; font-size: 12px; color: var(--muted); }
+.stack { display: grid; gap: 16px; }
+.preview { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16/9; }
+.preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.preview .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+[hidden] { display: none !important; }
+label.toggle { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+input, select { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+                border-radius: 10px; padding: 10px 12px; width: 100%; min-width: 0; }
+.channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
+            max-height: 360px; overflow-y: auto; margin-top: 10px; padding-right: 2px; }
+.ch { display: grid; gap: 4px; justify-items: center; padding: 8px 6px; font-size: 12px; }
+.ch img { width: 56px; height: 34px; object-fit: contain; }
+.ch .num { color: var(--muted); font-size: 11px; }
+.ch .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.form { display: grid; grid-template-columns: 1fr 64px 64px; gap: 8px; margin-top: 8px; }
+.form .full { grid-column: 1 / -1; }
+#toast { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); max-width: calc(100% - 32px);
+         background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px;
+         box-shadow: 0 8px 30px rgba(0,0,0,.35); font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+#toast.show { opacity: 1; }
+#toast.err { border-color: var(--err); color: var(--err); }
+.hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Formuler Remote</h1>
+  <span id="state" class="pill">…</span>
+</header>
+<main>
+  <div class="stack">
+    <section aria-label="Remote">
+      <h2>Remote</h2>
+      <div class="row" style="margin-bottom:12px">
+        <button data-cmd="wake">Power on</button>
+        <button data-cmd="power-off">Power off</button>
+      </div>
+      <div class="dpad">
+        <span></span><button data-key="up" aria-label="Up">▲</button><span></span>
+        <button data-key="left" aria-label="Left">◀</button>
+        <button data-key="ok" class="ok">OK</button>
+        <button data-key="right" aria-label="Right">▶</button>
+        <span></span><button data-key="down" aria-label="Down">▼</button><span></span>
+      </div>
+      <div class="row">
+        <button data-key="back">Back</button>
+        <button data-key="home">Home</button>
+        <button data-key="menu">Menu</button>
+      </div>
+      <div class="rockers">
+        <div class="rocker"><button data-key="volume-up">＋</button><span>Volume</span><button data-key="volume-down">－</button></div>
+        <div class="rocker"><button data-key="mute">Mute</button><button data-key="play-pause">⏯</button><button data-key="info">Info</button></div>
+        <div class="rocker"><button data-key="channel-up">＋</button><span>Channel</span><button data-key="channel-down">－</button></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button data-cmd="prev">Previous ch.</button>
+        <button data-cmd="guide">Guide</button>
+      </div>
+    </section>
+
+    <section aria-label="Apps">
+      <h2>Apps</h2>
+      <div class="row">
+        <button data-cmd="open mytv">MyTVOnline</button>
+        <button data-cmd="open youtube">YouTube</button>
+        <button data-cmd="open prime">Prime Video</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section aria-label="Screen">
+      <h2>Screen</h2>
+      <div class="preview"><img id="shot" alt="TV screen" hidden><div id="shot-empty" class="empty">No screenshot yet</div></div>
+      <div class="row" style="margin-top:10px; align-items:center">
+        <button id="refresh">Refresh</button>
+        <label class="toggle"><input id="auto" type="checkbox" style="width:auto"> Auto (5 s)</label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button data-cmd="mirror">Mirror (sound on laptop)</button>
+        <button data-cmd="mirror --no-audio">Mirror (sound on TV)</button>
+      </div>
+      <p class="hint">Mirroring opens a window on the computer running the server.</p>
+    </section>
+
+    <section aria-label="Channels">
+      <h2>Channels</h2>
+      <input id="filter" type="search" placeholder="Filter channels (e.g. NL, NPO, sport)" autocomplete="off">
+      <div id="channels" class="channels"></div>
+      <p id="ch-hint" class="hint"></p>
+    </section>
+
+    <section aria-label="Play">
+      <h2>Play a series or movie</h2>
+      <div class="form">
+        <select id="kind" class="full"><option value="series">Series</option><option value="movie">Movie</option></select>
+        <input id="title" placeholder="Title, e.g. below deck adventure">
+        <input id="season" type="number" min="1" value="1" aria-label="Season">
+        <input id="episode" type="number" min="1" value="1" aria-label="Episode">
+        <button id="play" class="primary full">Play</button>
+      </div>
+      <p class="hint">Searching and starting can take 1–2 minutes. Playback is checked before it reports success.</p>
+    </section>
+  </div>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const $ = (s) => document.querySelector(s);
+let toastTimer;
+function toast(msg, err = false) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = "show" + (err ? " err" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "", err ? 6000 : 3000);
+}
+async function api(path, body) {
+  const opts = { headers: { "X-Token": token } };
+  if (body) { opts.method = "POST"; opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  return r.headers.get("Content-Type")?.startsWith("application/json") ? r.json() : r;
+}
+async function key(name) {
+  if (navigator.vibrate) navigator.vibrate(10);
+  const r = await api("/api/key", { key: name });
+  if (!r.ok) toast(r.error || "Key failed", true);
+}
+async function run(cmd, btn) {
+  if (btn) btn.disabled = true;
+  toast("Working: " + cmd);
+  try {
+    const r = await api("/api/cmd", { cmd });
+    if (r.ok) toast((r.messages || []).slice(-1)[0] || "Done");
+    else toast(r.error || "Failed", true);
+    setTimeout(refreshShot, 1500);
+    return r;
+  } catch (e) { toast("Server unreachable", true); }
+  finally { if (btn) btn.disabled = false; }
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.key) key(b.dataset.key);
+  else if (b.dataset.cmd) run(b.dataset.cmd, b);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches("input, select")) return;
+  const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+                Enter: "ok", Backspace: "back", Escape: "back", h: "home", m: "mute",
+                "+": "volume-up", "-": "volume-down", PageUp: "channel-up", PageDown: "channel-down" };
+  if (map[e.key]) { e.preventDefault(); key(map[e.key]); }
+});
+async function refreshShot() {
+  const r = await fetch("/api/screenshot", { headers: { "X-Token": token } });
+  if (!r.ok) return;
+  const url = URL.createObjectURL(await r.blob());
+  const img = $("#shot"); const old = img.src;
+  img.src = url; img.hidden = false; $("#shot-empty").hidden = true;
+  if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+}
+$("#refresh").onclick = refreshShot;
+let autoTimer;
+$("#auto").onchange = (e) => {
+  clearInterval(autoTimer);
+  if (e.target.checked) { refreshShot(); autoTimer = setInterval(refreshShot, 5000); }
+};
+let allChannels = [];
+function renderChannels() {
+  const q = $("#filter").value.trim().toLowerCase();
+  const list = allChannels.filter(c => !q || c.title.toLowerCase().includes(q) || String(c.number) === q);
+  const box = $("#channels"); box.innerHTML = "";
+  for (const c of list.slice(0, 200)) {
+    const b = document.createElement("button");
+    b.className = "ch"; b.dataset.cmd = "tune " + c.number; b.title = c.title;
+    const name = c.title.replace(/^[A-Z]{2,3}\s*\|\s*/, "").replace(/\s+(4K|UHD|FHD|HD)$/i, "");
+    if (c.logo) { const i = document.createElement("img"); i.src = c.logo; i.alt = ""; i.loading = "lazy";
+                  i.onerror = () => i.remove(); b.append(i); }
+    const n = document.createElement("span"); n.className = "num"; n.textContent = c.number;
+    const t = document.createElement("span"); t.className = "name"; t.textContent = name;
+    b.append(n, t); box.append(b);
+  }
+  $("#ch-hint").textContent = allChannels.length ? `${list.length} of ${allChannels.length} channels`
+    : "No channel list yet. Run 'formuler-remote refresh-all' once.";
+}
+$("#filter").oninput = renderChannels;
+async function loadChannels() {
+  const r = await api("/api/channels");
+  allChannels = r.channels || []; renderChannels();
+}
+$("#play").onclick = () => {
+  const title = $("#title").value.trim();
+  if (!title) return toast("Enter a title", true);
+  const cmd = $("#kind").value === "series"
+    ? `play-series ${title} ${$("#season").value || 1} ${$("#episode").value || 1}`
+    : `play-movie ${title}`;
+  run(cmd, $("#play"));
+};
+$("#kind").onchange = () => {
+  const movie = $("#kind").value === "movie";
+  $("#season").hidden = $("#episode").hidden = movie;
+};
+async function refreshState() {
+  try {
+    const s = await api("/api/status");
+    const el = $("#state");
+    const label = s.activity === "LiveActivity" ? "Live TV" : (s.activity || "Offline").replace(/Activity$/, "");
+    el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "");
+    el.className = "pill" + (s.playing ? " on" : "");
+  } catch (e) { $("#state").textContent = "Offline"; }
+}
+loadChannels(); refreshState(); setInterval(refreshState, 10000);
+</script>
+</body>
+</html>
+"""
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3025,7 +3510,9 @@ def main():
     _lock_file = open(CACHE_DIR / ".lock", "w", encoding="utf-8")
     try:
         import fcntl
-        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Commands run by the web remote are children of the server, which holds the lock
+        if not os.environ.get("FORMULER_KEEP_CONNECTION"):
+            fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except ImportError:
         pass  # fcntl not available on Windows — skip locking
     except OSError:

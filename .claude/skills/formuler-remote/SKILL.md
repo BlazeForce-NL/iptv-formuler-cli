@@ -51,6 +51,9 @@ Uses direct deeplinks via the Android content provider for instant VOD/series pl
 | Export M3U | `formuler-remote --json export-m3u channels.m3u` |
 | Mirror screen to this computer (audio here, TV muted) | `formuler-remote --json mirror` |
 | Mirror screen, sound stays on TV | `formuler-remote --json mirror --no-audio` |
+| Web remote for phone/tablet (blocks; run in background) | `formuler-remote serve` |
+
+`play-movie` / `play-series` return `"verified": true` only when playback actually started; otherwise `ok: false` with the player's error or a timeout (this provider can take ~50s to start VOD).
 | Watch screenshots | `formuler-remote --json watch 5 /tmp` |
 | Chain commands | `formuler-remote --json --first 'tune TF1 ; wait 5 ; screenshot'` |
 | List commands | `formuler-remote --json commands` |
