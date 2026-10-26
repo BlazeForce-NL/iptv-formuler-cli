@@ -193,7 +193,7 @@ formuler-remote serve 9000       # other port
 formuler-remote serve --local    # only this computer (127.0.0.1)
 ```
 
-It prints a link like `http://192.168.0.185:8765/?t=…`. Open it on your phone and bookmark it. The page has a D-pad, volume/channel keys, app buttons (MyTVOnline, YouTube, Prime Video), a channel grid with logos per country (Nederland, België, USA, Canada, Australië, Nieuw-Zeeland) with TV / 24/7 / Events / Radio filters, a play form for series/movies, mirror buttons and a screen preview. Arrow keys, Enter, Backspace, `+`/`-` and PageUp/PageDown work on a keyboard too.
+It prints a link like `http://192.168.0.185:8765/?t=…`. Open it on your phone and bookmark it. The page has a D-pad, volume/channel keys, app buttons (MyTVOnline, YouTube, Prime Video), a channel grid with logos per country (Nederland, België, USA, Canada, Australië, Nieuw-Zeeland) with TV / 24/7 / Events / Radio filters (variants such as `NPO1 4K` / `NPO 1 FHD` / `NPO1 LQ` show as one tile that tunes the best quality; tick *All variants* to see them all), a play form for series/movies, mirror buttons and a screen preview. Arrow keys, Enter, Backspace, `+`/`-` and PageUp/PageDown work on a keyboard too.
 
 - **Access token:** every request needs the token in the link. It is stored in `~/.cache/formuler-remote/web_token` so bookmarks survive restarts; delete that file to revoke old links.
 - **Allowed commands:** the page can only run remote-control commands (tune, play, open, mirror, …), not `reboot`, `serve`, `watch` or `record`.

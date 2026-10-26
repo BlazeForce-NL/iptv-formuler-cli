@@ -1269,6 +1269,22 @@ def _channel_kind(title: str) -> str:
     return "tv"
 
 
+# Quality tags in channel titles, best first; untagged ranks between HD and HEVC
+_QUALITY_RANK = {"4K": 7, "UHD": 7, "ULTRA": 6, "FHD": 5, "RAW": 4, "HD": 3, "HEVC": 1, "H265": 1, "SD": 1, "LQ": 0}
+_QUALITY_TAG = re.compile(r"\b(4K|UHD|ULTRA|FHD|RAW|HD|HEVC|H265|SD|LQ|HQ|50FPS)\b")
+
+
+def _channel_key(title: str) -> tuple[str, int, str]:
+    """(group key, quality rank, quality label) for a title: 'NL| NPO 1 FHD' -> ('NPO1', 5, 'FHD')."""
+    t = unicodedata.normalize("NFKC", title).upper()  # NFKC turns 'ᴿᴬᵂ' into 'RAW'
+    t = re.sub(r"^[A-Z.]{2,4}\s*\|\s*", "", t)
+    tags = _QUALITY_TAG.findall(t)
+    key = re.sub(r"[^A-Z0-9+&!]", "", _QUALITY_TAG.sub("", t))
+    rank = max((_QUALITY_RANK.get(q, 2) for q in tags), default=2)
+    label = next((q for q in tags if _QUALITY_RANK.get(q, 2) == rank), "")
+    return key or t, rank, label
+
+
 def country_channels(ip: str, code: str, force_refresh: bool = False) -> list[dict]:
     """All live channels of one country, read from the search provider in one query per prefix."""
     code = code.lower()
@@ -3030,9 +3046,12 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         return proc.stdout if proc.returncode == 0 and proc.stdout[:4] == b"\x89PNG" else None
 
     def channels(country: str) -> list[dict]:
-        return [{"number": c.get("number") or "", "title": c.get("title", ""), "logo": c.get("logo") or "",
-                 "id": c["unique_id"], "kind": c.get("kind", "tv")}
-                for c in country_channels(ip, country)]
+        out = []
+        for c in country_channels(ip, country):
+            key, rank, label = _channel_key(c.get("title", ""))
+            out.append({"number": c.get("number") or "", "title": c.get("title", ""), "logo": c.get("logo") or "",
+                        "id": c["unique_id"], "kind": c.get("kind", "tv"), "key": key, "rank": rank, "q": label})
+        return out
 
     # ── Live stream to the browser ──
     # scrcpy (no window) records the box's screen + audio to a growing MKV; ffmpeg
@@ -3431,7 +3450,11 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
       </div>
       <input id="filter" type="search" placeholder="Filter channels (e.g. NPO, sport, 42)" autocomplete="off">
       <div id="channels" class="channels"></div>
-      <p id="ch-hint" class="hint"></p>
+      <div class="row" style="margin-top:8px; align-items:center">
+        <p id="ch-hint" class="hint" style="margin:0"></p>
+        <label class="toggle" style="flex:none"><input id="variants" type="checkbox" style="width:auto"> All variants</label>
+      </div>
+      <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.</p>
     </section>
 
     <section aria-label="Play">
@@ -3509,27 +3532,49 @@ $("#auto").onchange = (e) => {
 };
 let allChannels = [], country = "nl", kind = "";
 try { country = localStorage.getItem("country") || "nl"; } catch (e) {}
+const QUALITY = /\s*\b(ULTRA\s+)?(4K|UHD|FHD|HD|HEVC|H265|SD|LQ|HQ|50FPS)\b|[ᴬ-ᵡ◉²]+/gi;
 function renderChannels() {
   const q = $("#filter").value.trim().toLowerCase();
-  const list = allChannels.filter(c => (!kind || c.kind === kind)
-    && (!q || c.title.toLowerCase().includes(q) || String(c.number) === q));
+  const all = $("#variants").checked;
+  const match = c => c.title.toLowerCase().includes(q) || String(c.number) === q;
+  // Group variants of one channel (NPO1 4K / NPO 1 FHD / NPO1 LQ) unless "all variants" is on
+  let groups = [];
+  if (all) groups = allChannels.map(c => [c]);
+  else {
+    const byKey = new Map();
+    for (const c of allChannels) {
+      const k = c.kind + "|" + c.key;
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(c);
+    }
+    groups = [...byKey.values()].map(g => g.sort((a, b) => b.rank - a.rank || a.number - b.number));
+    groups.sort((a, b) => Math.min(...a.map(c => +c.number || 1e9)) - Math.min(...b.map(c => +c.number || 1e9)));
+  }
+  const list = groups.filter(g => (!kind || g[0].kind === kind) && (!q || g.some(match)));
   const box = $("#channels"); box.innerHTML = "";
-  for (const c of list.slice(0, 300)) {
-    const b = document.createElement("button");
-    b.className = "ch"; b.dataset.cmd = "tune-id " + c.id; b.title = c.title;
-    const name = c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "").replace(/\s+(4K|UHD|FHD|HD)$/i, "");
-    if (c.logo) { const i = document.createElement("img"); i.src = c.logo; i.alt = ""; i.loading = "lazy";
-                  i.onerror = () => i.remove(); b.append(i); }
-    const n = document.createElement("span"); n.className = "num"; n.textContent = c.number;
+  for (const g of list.slice(0, 300)) {
+    const c = g[0], b = document.createElement("button");
+    b.className = "ch"; b.dataset.cmd = "tune-id " + c.id;
+    b.title = g.length > 1 ? `${c.title} (best of ${g.length}: ${g.map(v => v.q || "SD").join(", ")})` : c.title;
+    let name = c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "");
+    if (!all) name = name.replace(QUALITY, "").trim() || name;
+    const logo = g.find(v => v.logo)?.logo;
+    if (logo) { const i = document.createElement("img"); i.src = logo; i.alt = ""; i.loading = "lazy";
+                i.onerror = () => i.remove(); b.append(i); }
+    const n = document.createElement("span"); n.className = "num";
+    n.textContent = c.number + (!all && c.q ? " · " + c.q : "") + (g.length > 1 ? ` · +${g.length - 1}` : "");
     const t = document.createElement("span"); t.className = "name"; t.textContent = name;
     b.append(n, t); box.append(b);
   }
+  const total = groups.filter(g => !kind || g[0].kind === kind).length;
   $("#ch-hint").textContent = allChannels.length
-    ? `${list.length} of ${allChannels.length} channels` + (list.length > 300 ? " (first 300 shown, filter to narrow)" : "")
+    ? `${list.length} of ${total} channels` + (all ? "" : ` (${allChannels.length} incl. variants)`)
+      + (list.length > 300 ? ", first 300 shown, filter to narrow" : "")
     : "No channels found for this country.";
   for (const k of $("#kinds").children) k.hidden = !!k.dataset.kind && !allChannels.some(c => c.kind === k.dataset.kind);
 }
 $("#filter").oninput = renderChannels;
+$("#variants").onchange = renderChannels;
 $("#kinds").onclick = (e) => {
   const b = e.target.closest("button"); if (!b) return;
   kind = b.dataset.kind;
