@@ -3015,7 +3015,9 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 return {"ok": False, "error": f"Stream did not start: {err}"}
             live["ffmpeg"] = _spawn(
                 [ffmpeg, "-hide_banner", "-loglevel", "error", "-follow", "1", "-i", f"file:{mkv}",
-                 "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
+                 # scrcpy's MKV leaves the keyframe flag off audio blocks; without
+                 # -copyinkf the stream copy drops every audio packet
+                 "-copyinkf", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
                  "-hls_flags", "delete_segments+omit_endlist+independent_segments",
                  str(d / "hls" / "live.m3u8")],
                 d / "ffmpeg.log")
