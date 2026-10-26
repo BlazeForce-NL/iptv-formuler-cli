@@ -48,11 +48,26 @@ import re
 import subprocess
 import sys
 import shutil
+import tempfile
 import threading
 import time
 import unicodedata
-import readline  # arrow-key history in interactive mode
 from pathlib import Path
+
+try:
+    import readline  # arrow-key history in interactive mode
+except ImportError:
+    readline = None  # Windows without pyreadline3: no completion/history
+
+if os.name == "nt":
+    os.system("")  # enable ANSI escape sequences in the Windows console
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass
+
+TMP_DIR = Path(tempfile.gettempdir())
 
 # ──────────────────────── Color Support ────────────────────────
 
@@ -86,7 +101,7 @@ def _load_env(path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
         return env
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -106,7 +121,7 @@ def _load_config() -> dict:
             pass
     if CONFIG_JSON.exists():
         try:
-            with open(CONFIG_JSON) as f:
+            with open(CONFIG_JSON, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -313,7 +328,7 @@ COMMANDS = {
     "key": {"args": "<keyname>", "desc": "Send a single key event"},
     "open": {"args": "<app>", "desc": "Launch app (youtube/netflix/prime/mytv/plex/kodi/vlc/disney/settings)"},
     "apps": {"args": "", "desc": "List installed third-party apps"},
-    "screenshot": {"args": "[path]", "desc": "Capture screen to file (default /tmp/formuler-screenshot.png)"},
+    "screenshot": {"args": "[path]", "desc": "Capture screen to file (default: temp dir/formuler-screenshot.png)"},
     "status": {"args": "", "desc": "Show device info (model, Android version, uptime, foreground app)"},
     "reboot": {"args": "", "desc": "Reboot device (requires --yes to skip confirmation)"},
     "export-m3u": {"args": "[path]", "desc": "Export channel lineup as M3U playlist (metadata only, no stream URLs)"},
@@ -400,7 +415,8 @@ def run_adb(*args: str, timeout: int = 10) -> tuple[int, str]:
         return 0, ""
     try:
         result = subprocess.run(
-            ["adb", *args], capture_output=True, text=True, timeout=timeout
+            ["adb", *args], capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",  # device output is UTF-8, not the Windows locale
         )
         return result.returncode, (result.stdout + result.stderr).strip()
     except subprocess.TimeoutExpired:
@@ -504,11 +520,11 @@ def text_input(ip: str, t: str) -> bool:
 def ui_dump(ip: str) -> str:
     """Dump UI hierarchy and return XML string."""
     adb(ip, "shell", "uiautomator", "dump", "/sdcard/ui.xml", timeout=10)
-    code, out = run_adb("-s", tgt(ip), "pull", "/sdcard/ui.xml", "/tmp/formuler-ui.xml")
+    code, out = run_adb("-s", tgt(ip), "pull", "/sdcard/ui.xml", str(TMP_DIR / "formuler-ui.xml"))
     if code != 0:
         return ""
     try:
-        return Path("/tmp/formuler-ui.xml").read_text()
+        return (TMP_DIR / "formuler-ui.xml").read_text(encoding="utf-8")
     except OSError:
         return ""
 
@@ -692,6 +708,23 @@ def _get_current_activity(ip: str) -> str:
     return ""
 
 
+def _reset_to_live(ip: str):
+    """Make sure MyTVOnline starts from its live TV screen.
+
+    Section navigation (menu → down×N → ok) only works from LiveActivity. From a
+    VOD player, detail page or the search screen those keys land elsewhere (e.g.
+    "Continue" on a detail page), so restart the app in that case.
+    """
+    if _get_current_activity(ip) == "LiveActivity":
+        return
+    adb(ip, "shell", "am", "force-stop", MOL3_PKG)
+    wait(NAV_DELAY * 2)
+    adb(ip, "shell", "monkey", "-p", MOL3_PKG, "-c", "android.intent.category.LAUNCHER", "1")
+    if not _wait_for_activity(ip, "LiveActivity", timeout=15):
+        warn("MyTVOnline did not return to live TV; search navigation may be off")
+    wait(LOAD_DELAY)
+
+
 def do_search(ip: str, query: str, section: str = "vod"):
     """Search for content using the universal search UI.
 
@@ -700,6 +733,7 @@ def do_search(ip: str, query: str, section: str = "vod"):
     2. Type query (spaces encoded as %s for ADB)
     3. Press Enter → results appear with category tabs
     """
+    _reset_to_live(ip)
     open_search(ip, section)
     text_input(ip, query)
     wait(NAV_DELAY * 2)
@@ -721,6 +755,169 @@ def select_first_result(ip: str):
     wait(NAV_DELAY)
     key(ip, "ok")
     wait(LOAD_DELAY)
+
+
+def _ui_root(ip: str):
+    """Dump the UI and return the parsed XML root, or None."""
+    import xml.etree.ElementTree as ET
+    xml_str = ui_dump(ip)
+    if not xml_str:
+        return None
+    try:
+        return ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+
+
+def _rid(node) -> str:
+    return node.get("resource-id", "").split("/")[-1]
+
+
+def _focused_texts(root, rid: str) -> list[str]:
+    """Texts with the given resource-id inside the focused node."""
+    for node in root.iter("node"):
+        if node.get("focused") == "true":
+            return [n.get("text", "") for n in node.iter("node") if _rid(n) == rid]
+    return []
+
+
+def _move_focus_to(ip: str, rid: str, target_index, axis: str = "horizontal",
+                   max_rounds: int = 4) -> bool:
+    """Move D-pad focus until the focused item is the target among items with `rid`.
+
+    `target_index(texts)` returns the wanted index in the list of all texts with
+    `rid` (document order). Each round reads the UI, presses the arrow key the
+    needed number of times, and re-checks, so slow UIs self-correct.
+    """
+    prev_key, next_key = ("left", "right") if axis == "horizontal" else ("up", "down")
+    for _ in range(max_rounds):
+        root = _ui_root(ip)
+        if root is None:
+            return False
+        texts = [n.get("text", "") for n in root.iter("node") if _rid(n) == rid]
+        focused = _focused_texts(root, rid)
+        want = target_index(texts)
+        if want is None:
+            return False
+        if not focused or focused[0] not in texts:
+            return False
+        delta = want - texts.index(focused[0])
+        if delta == 0:
+            return True
+        for _ in range(abs(delta)):
+            key(ip, next_key if delta > 0 else prev_key)
+            wait(NAV_DELAY)
+        wait(NAV_DELAY)
+    return False
+
+
+def _clean_result_title(title: str) -> str:
+    """'EN - Below Deck Adventure (2022) (US)' → 'Below Deck Adventure'."""
+    title = re.sub(r"^[A-Z]{2,3}\s*[-|]\s*", "", title)
+    return re.sub(r"\s*\([^)]*\)", "", title).strip()
+
+
+def select_matching_result(ip: str, query: str) -> str | None:
+    """Select the search result whose title best matches `query` and open it.
+
+    Uses _fuzzy_match on the result titles (exact > starts-with > contains,
+    shorter preferred), so 'below deck' picks 'Below Deck' and not the first
+    tile 'Below Deck Mediterranean'. Returns the chosen title, or None.
+    """
+    rid = "stream_search_result_title"
+
+    def target(texts):
+        candidates = [{"title": _clean_result_title(t), "index": i} for i, t in enumerate(texts)]
+        matches = _fuzzy_match(query, candidates)
+        return matches[0]["index"] if matches else None
+
+    # Focus starts on the category tabs; move down into the results row
+    root = _ui_root(ip)
+    for _ in range(2):
+        if root is not None and _focused_texts(root, rid):
+            break
+        key(ip, "down")
+        wait(NAV_DELAY * 2)
+        root = _ui_root(ip)
+    if root is None or not _focused_texts(root, rid):
+        return None
+
+    if not _move_focus_to(ip, rid, target):
+        return None
+    chosen = _focused_texts(_ui_root(ip), rid)
+    key(ip, "ok")
+    wait(LOAD_DELAY)
+    return chosen[0] if chosen else None
+
+
+_ALL_EPISODES_LABELS = ("alle afleveringen", "all episodes", "tous les episodes",
+                        "alle folgen", "todos los episodios", "tutti gli episodi")
+
+
+def open_all_episodes(ip: str) -> bool:
+    """On a series detail page, focus the 'All episodes' action and press OK.
+
+    The focused action differs per firmware and watch state (e.g. 'Doorgaan',
+    or the trailer 'Voorbeeld' row), so the label is looked up instead of
+    pressing OK on whatever happens to be focused.
+    """
+    rid = "detail_overview_action_label"
+
+    def target(texts):
+        for i, t in enumerate(texts):
+            if _normalize(t) in _ALL_EPISODES_LABELS:
+                return i
+        return None
+
+    # Focus may sit below the action row (e.g. on the trailer); move up into it
+    for _ in range(4):
+        root = _ui_root(ip)
+        if root is None:
+            return False
+        if _focused_texts(root, rid):
+            break
+        key(ip, "up")
+        wait(NAV_DELAY * 2)
+    else:
+        return False
+
+    if not _move_focus_to(ip, rid, target):
+        return False
+    key(ip, "ok")
+    wait(LOAD_DELAY)
+    return True
+
+
+def _episode_number(breadcrumb: str) -> tuple[int, int] | None:
+    """'S1:A3' / 'S1:E3' → (1, 3)."""
+    m = re.match(r"S(\d+)\s*[:.]\s*\D*(\d+)", breadcrumb)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def select_episode(ip: str, season: int, episode: int) -> bool:
+    """In the episode browser, pick season (by position) and episode (by breadcrumb)."""
+    if not _move_focus_to(ip, "season_name", lambda texts: season - 1 if season <= len(texts) else None,
+                          axis="vertical"):
+        return False
+    wait(LOAD_DELAY * 0.5)
+    key(ip, "right")  # into the episode list, E1 focused
+    wait(NAV_DELAY * 2)
+
+    for _ in range(episode + 2):
+        root = _ui_root(ip)
+        focused = _focused_texts(root, "series_episode_breadcrumb") if root is not None else []
+        parsed = _episode_number(focused[0]) if focused else None
+        if parsed is None:
+            return False
+        if parsed[1] == episode:
+            return True
+        # Episode list is virtualized, so step and re-check instead of jumping
+        steps = episode - parsed[1]
+        for _ in range(abs(steps)):
+            key(ip, "down" if steps > 0 else "up")
+            wait(NAV_DELAY)
+        wait(NAV_DELAY * 2)
+    return False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -804,10 +1001,11 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
     2. Build deeplink with target season/episode using stalker:// URL
     3. Fire deeplink with channel_type=2 (series history) → auto-plays
 
-    Fallback (slow path — UI navigation):
-    1. Search → select series → "Tous les épisodes" (auto-focused) → OK
-    2. Episode browser: seasons left, episodes right
-    3. Down×(S-1) for season, Right, Down×(E-1) for episode, OK to play
+    Fallback (slow path — UI navigation, verified with UI dumps at each step):
+    1. Search → focus the result whose title best matches the query → OK
+    2. Detail page: focus the "All episodes" action by label → OK
+    3. Episode browser: seasons left, episodes right; navigate until the
+       focused breadcrumb reads S{season}:A{episode}, then OK to play
     """
     label = f"'{query}' S{season:02d}E{episode:02d}"
 
@@ -837,35 +1035,26 @@ def play_series(ip: str, query: str, season: int = 1, episode: int = 1):
 
     # Slow path: UI-based search
     do_search(ip, query, section="series")
-    select_first_result(ip)
+    title = select_matching_result(ip, query)
+    if not title:
+        output_err(f"No series result matching '{query}'")
+        return
 
-    # Detail page: "Tous les épisodes" is auto-focused → press OK
     wait(LOAD_DELAY * 0.5)
-    key(ip, "ok")
-    wait(LOAD_DELAY)
+    if not open_all_episodes(ip):
+        output_err(f"Could not open the episode list for '{title}'")
+        return
 
-    # Episode browser: seasons on left (Season 1 selected), episodes on right
-    if season > 1:
-        for _ in range(season - 1):
-            key(ip, "down")
-            wait(NAV_DELAY * 1.2)
-        wait(NAV_DELAY * 2)
-
-    # Move right to episode list
-    key(ip, "right")
-    wait(NAV_DELAY)
-
-    # Navigate to correct episode (E1 is focused by default)
-    if episode > 1:
-        for _ in range(episode - 1):
-            key(ip, "down")
-            wait(NAV_DELAY * 1.2)
+    if not select_episode(ip, season, episode):
+        output_err(f"Episode S{season:02d}E{episode:02d} not found for '{title}'")
+        return
 
     # Play
     key(ip, "ok")
     wait(LOAD_DELAY * 0.5)
+    label = f"'{_clean_result_title(title)}' S{season:02d}E{episode:02d}"
     output_ok(f"Playing {label}", {
-        "query": query, "season": season, "episode": episode, "method": "search"
+        "query": query, "title": title, "season": season, "episode": episode, "method": "search"
     })
     _notify("Formuler Remote", f"Playing: {label}")
 
@@ -966,12 +1155,12 @@ def search_provider(ip: str, query: str) -> list[dict]:
 
 def get_channels(ip: str, force_refresh: bool = False) -> list[dict]:
     if not force_refresh and CHANNELS_CACHE.exists():
-        with open(CHANNELS_CACHE) as f:
+        with open(CHANNELS_CACHE, encoding="utf-8") as f:
             return json.load(f)
     channels = fetch_channels(ip)
     if channels:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CHANNELS_CACHE, "w") as f:
+        with open(CHANNELS_CACHE, "w", encoding="utf-8") as f:
             json.dump(channels, f, indent=2, ensure_ascii=False)
         info(f"Cached {len(channels)} channels/entries")
     return channels
@@ -1005,14 +1194,14 @@ def get_full_channels(ip: str, force_refresh: bool = False) -> list[dict]:
     if not force_refresh and FULL_CHANNELS_CACHE.exists():
         age_hours = (time.time() - FULL_CHANNELS_CACHE.stat().st_mtime) / 3600
         if age_hours < max_age:
-            with open(FULL_CHANNELS_CACHE) as f:
+            with open(FULL_CHANNELS_CACHE, encoding="utf-8") as f:
                 return json.load(f)
         warn(f"Channel cache stale ({age_hours:.0f}h old). Refreshing...")
 
     channels = enumerate_channels(ip)
     if channels:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(FULL_CHANNELS_CACHE, "w") as f:
+        with open(FULL_CHANNELS_CACHE, "w", encoding="utf-8") as f:
             json.dump(channels, f, indent=2, ensure_ascii=False)
         info(f"Cached {len(channels)} channels")
     return channels
@@ -1032,7 +1221,7 @@ def channel_by_number(ip: str, number: str) -> dict | None:
 def _load_tune_history() -> list[dict]:
     if TUNE_HISTORY_FILE.exists():
         try:
-            with open(TUNE_HISTORY_FILE) as f:
+            with open(TUNE_HISTORY_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -1041,7 +1230,7 @@ def _load_tune_history() -> list[dict]:
 
 def _save_tune_history(history: list[dict]):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(TUNE_HISTORY_FILE, "w") as f:
+    with open(TUNE_HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history[-50:], f, indent=2, ensure_ascii=False)
 
 
@@ -1235,7 +1424,7 @@ def _find_content(query: str, categories: tuple[str, ...]) -> list[dict]:
     if not CHANNELS_CACHE.exists():
         return []
     try:
-        with open(CHANNELS_CACHE) as f:
+        with open(CHANNELS_CACHE, encoding="utf-8") as f:
             channels = json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
@@ -1305,7 +1494,7 @@ def cmd_tune(ip: str, query: str):
 
     # Try full channel cache first
     if FULL_CHANNELS_CACHE.exists():
-        with open(FULL_CHANNELS_CACHE) as f:
+        with open(FULL_CHANNELS_CACHE, encoding="utf-8") as f:
             full = json.load(f)
         # Try exact channel number
         if query.isdigit():
@@ -1499,8 +1688,8 @@ def cmd_episodes(ip: str, query: str):
     wait(LOAD_DELAY * 0.5)
     key(ip, "ok")  # open episodes browser
     wait(LOAD_DELAY)
-    screenshot(ip, f"/tmp/formuler-episodes.png")
-    output_ok(f"Episode browser open for '{query}'. Screenshot saved to /tmp/formuler-episodes.png")
+    screenshot(ip, str(TMP_DIR / "formuler-episodes.png"))
+    output_ok(f"Episode browser open for '{query}'. Screenshot saved to {TMP_DIR / 'formuler-episodes.png'}")
     if not JSON_MODE:
         print("Navigate with arrow keys. 'back' to return.")
 
@@ -1633,7 +1822,7 @@ def cmd_epg(ip: str, channel: str = ""):
         wait(3)
     key(ip, "info")
     wait(1)
-    path = "/tmp/formuler-epg.png"
+    path = str(TMP_DIR / "formuler-epg.png")
     screenshot(ip, path)
     output_ok(f"EPG info screenshot saved to {path}", {"screenshot": path})
     key(ip, "info")  # dismiss
@@ -1643,7 +1832,7 @@ def cmd_guide(ip: str):
     ensure_mytv(ip)
     key(ip, "guide")
     wait(2)
-    path = "/tmp/formuler-guide.png"
+    path = str(TMP_DIR / "formuler-guide.png")
     screenshot(ip, path)
     output_ok(f"EPG guide screenshot saved to {path}", {"screenshot": path})
 
@@ -1909,7 +2098,7 @@ def cmd_cec(ip: str, action: str):
         output_err(f"Unknown CEC action: {action}. Use: on, off, standby")
 
 
-def cmd_record_screen(ip: str, duration: int = 30, path: str = "/tmp/formuler-recording.mp4"):
+def cmd_record_screen(ip: str, duration: int = 30, path: str = str(TMP_DIR / "formuler-recording.mp4")):
     remote = "/sdcard/recording.mp4"
     info(f"Recording for {duration}s... (video surfaces will be green due to DRM)")
     try:
@@ -1948,7 +2137,7 @@ def cmd_history(count: int = 20):
     if not history_file.exists():
         output_err("No command history found.")
         return
-    lines = history_file.read_text().splitlines()
+    lines = history_file.read_text(encoding="utf-8").splitlines()
     recent = lines[-count:] if count < len(lines) else lines
     if JSON_MODE:
         output(recent)
@@ -1957,7 +2146,7 @@ def cmd_history(count: int = 20):
             print(f"  {i:3d}  {line}")
 
 
-def cmd_watch(ip: str, interval: float = 5.0, directory: str = "/tmp"):
+def cmd_watch(ip: str, interval: float = 5.0, directory: str = str(TMP_DIR)):
     """Take screenshots at regular intervals until Ctrl-C."""
     info(f"Watching every {interval}s to {directory}/ (Ctrl-C to stop)")
     try:
@@ -2011,7 +2200,7 @@ def go_to_channel_number(ip: str, number: str):
     key(ip, "ok")
 
 
-def screenshot(ip: str, path: str = "/tmp/formuler-screenshot.png"):
+def screenshot(ip: str, path: str = str(TMP_DIR / "formuler-screenshot.png")):
     remote = "/sdcard/screenshot.png"
     code, out = adb(ip, "shell", "screencap", "-p", remote)
     if code != 0:
@@ -2315,7 +2504,7 @@ def dispatch(ip: str, raw: str) -> bool:
         cmd_cec(ip, args[0])
     elif cmd == "record":
         dur = int(args[0]) if args and args[0].isdigit() else 30
-        path = args[1] if len(args) > 1 else "/tmp/formuler-recording.mp4"
+        path = args[1] if len(args) > 1 else str(TMP_DIR / "formuler-recording.mp4")
         cmd_record_screen(ip, dur, path)
 
     # Text / direct key
@@ -2343,7 +2532,7 @@ def dispatch(ip: str, raw: str) -> bool:
         cmd_history(int(args[0]) if args and args[0].isdigit() else 20)
     elif cmd == "watch":
         interval = float(args[0]) if args and args[0].replace(".", "").isdigit() else 5.0
-        directory = args[1] if len(args) > 1 else "/tmp"
+        directory = args[1] if len(args) > 1 else str(TMP_DIR)
         cmd_watch(ip, interval, directory)
 
     # Connectivity
@@ -2352,7 +2541,7 @@ def dispatch(ip: str, raw: str) -> bool:
 
     # Misc
     elif cmd == "screenshot":
-        screenshot(ip, args[0] if args else "/tmp/formuler-screenshot.png")
+        screenshot(ip, args[0] if args else str(TMP_DIR / "formuler-screenshot.png"))
     elif cmd == "status":
         cmd_status(ip)
     elif cmd == "reboot":
@@ -2433,7 +2622,7 @@ def _make_completer(ip: str):
     channel_names: list[str] = []
     if CHANNELS_CACHE.exists():
         try:
-            with open(CHANNELS_CACHE) as f:
+            with open(CHANNELS_CACHE, encoding="utf-8") as f:
                 channel_names = list(set(c["title"] for c in json.load(f)))
         except (json.JSONDecodeError, KeyError):
             pass
@@ -2476,18 +2665,19 @@ def interactive(ip: str):
     if channels:
         print(f"Channel database: {_C.BOLD}{len(channels)}{_C.RESET} entries")
 
-    # Setup tab completion
-    readline.set_completer(_make_completer(ip))
-    readline.parse_and_bind("tab: complete")
-    readline.set_completer_delims(" ")
-
-    # Setup history file
     history_file = CACHE_DIR / "history"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        readline.read_history_file(history_file)
-    except FileNotFoundError:
-        pass
+    if readline:
+        # Setup tab completion
+        readline.set_completer(_make_completer(ip))
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer_delims(" ")
+
+        # Setup history file
+        try:
+            readline.read_history_file(history_file)
+        except (FileNotFoundError, OSError):
+            pass
 
     print(HELP_TEXT)
 
@@ -2503,10 +2693,11 @@ def interactive(ip: str):
         if not dispatch_chain(ip, raw):
             break
 
-    try:
-        readline.write_history_file(history_file)
-    except OSError:
-        pass
+    if readline:
+        try:
+            readline.write_history_file(history_file)
+        except OSError:
+            pass
 
     # Cancel pending timers
     for t in _timers:
@@ -2554,7 +2745,10 @@ def main():
     global JSON_MODE, AUTO_YES, AUTO_FIRST, VERBOSE, ADB_TIMEOUT
 
     if not shutil.which("adb"):
-        print("Error: adb not found. Install with: sudo pacman -S android-tools")
+        if os.name == "nt":
+            print("Error: adb not found. Install with: winget install Google.PlatformTools")
+        else:
+            print("Error: adb not found. Install with: sudo pacman -S android-tools")
         sys.exit(1)
 
     # Parse flags (including value-bearing ones)
@@ -2624,7 +2818,7 @@ def main():
 
     # Acquire lock to prevent concurrent instances
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _lock_file = open(CACHE_DIR / ".lock", "w")
+    _lock_file = open(CACHE_DIR / ".lock", "w", encoding="utf-8")
     try:
         import fcntl
         fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
