@@ -3462,6 +3462,118 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             out[uid] = [p for p in progs if p[1] > start and p[0] < end]
         return {"ok": True, "state": "ready", "channels": out}
 
+    def guide_search(query: str) -> dict:
+        """Upcoming programmes whose title (or description) matches, on channels of the countries."""
+        if guide["state"] != "ready":
+            return {"ok": guide["state"] != "error", "state": guide["state"], "error": guide["error"] or None, "results": []}
+        needle = _normalize(query)
+        if len(needle) < 2:
+            return {"ok": False, "error": "Type at least 2 letters"}
+        # XMLTV id -> best-quality tile of that channel
+        chans: dict[str, tuple] = {}
+        for code in COUNTRIES:
+            try:
+                rows = country_channels(ip, code)
+            except Exception:
+                continue
+            for c in rows:
+                epg_id = guide["ids"].get(_stream_id(c.get("unique_id", "")) or "")
+                if not epg_id or c.get("kind") == "radio":
+                    continue
+                rank = _channel_key(c.get("title", ""))[1]
+                if epg_id not in chans or rank > chans[epg_id][0]:
+                    chans[epg_id] = (rank, c)
+        now = time.time()
+        hits = []
+        for epg_id, (_, c) in chans.items():
+            for s, e, title, desc in guide["progs"].get(epg_id, []):
+                if e <= now:
+                    continue
+                in_title = needle in _normalize(title)
+                if in_title or needle in _normalize(desc):
+                    hits.append((not in_title, s, {"start": s, "end": e, "title": title, "desc": desc,
+                                                   "channel": c.get("title", ""), "id": c["unique_id"],
+                                                   "logo": c.get("logo") or ""}))
+        hits.sort(key=lambda h: (h[0], h[1]))
+        results = [h[2] for h in hits[:80]]
+        results.sort(key=lambda r: r["start"])
+        return {"ok": True, "state": "ready", "results": results, "more": len(hits) > 80}
+
+    # ── Timers: sleep timer and "tune the TV when it starts" ──
+    # They run in the server: the CLI's sleep-timer lives in the CLI process, which
+    # exits right after the page runs it. Saved to disk so they survive a restart.
+    timers_file = CACHE_DIR / "web_timers.json"
+    timers_lock = threading.Lock()
+    try:
+        timers = [t for t in json.loads(timers_file.read_text(encoding="utf-8")) if t["at"] > time.time() - 60]
+    except (OSError, ValueError, KeyError, TypeError):
+        timers = []
+
+    def _save_timers():
+        try:
+            timers_file.write_text(json.dumps(timers, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def timers_list() -> dict:
+        with timers_lock:
+            return {"ok": True, "timers": sorted(timers, key=lambda t: t["at"])}
+
+    def timer_add(body: dict) -> dict:
+        kind = body.get("kind")
+        with timers_lock:
+            if kind == "sleep":
+                try:
+                    minutes = float(body.get("minutes") or 0)
+                except (TypeError, ValueError):
+                    minutes = 0
+                if not 0 < minutes <= 24 * 60:
+                    return {"ok": False, "error": "Minutes must be between 1 and 1440"}
+                timers[:] = [t for t in timers if t["kind"] != "sleep"]
+                timers.append({"id": secrets.token_hex(4), "kind": "sleep", "at": time.time() + minutes * 60, "title": ""})
+            elif kind == "tune":
+                uid, title = str(body.get("id", "")), str(body.get("title", ""))[:200]
+                try:
+                    at = int(body.get("at") or 0)
+                except (TypeError, ValueError):
+                    at = 0
+                if not re.fullmatch(r"[\w.-]+", uid) or at < time.time() - 60:
+                    return {"ok": False, "error": "Invalid channel or time"}
+                if not any(t["kind"] == "tune" and t["uid"] == uid and t["at"] == at for t in timers):
+                    timers.append({"id": secrets.token_hex(4), "kind": "tune", "at": at, "uid": uid, "title": title})
+            else:
+                return {"ok": False, "error": "kind must be sleep or tune"}
+            _save_timers()
+        return timers_list()
+
+    def timer_cancel(timer_id: str) -> dict:
+        with timers_lock:
+            timers[:] = [t for t in timers if t["id"] != timer_id]
+            _save_timers()
+        return timers_list()
+
+    def timer_loop():
+        while True:
+            time.sleep(5)
+            now = time.time()
+            with timers_lock:
+                due = [t for t in timers if t["at"] <= now]
+                if due:
+                    timers[:] = [t for t in timers if t["at"] > now]
+                    _save_timers()
+            for t in due:
+                if t["kind"] == "sleep":
+                    live_stop()
+                    direct_stop()
+                    adb(ip, "shell", "input", "keyevent", str(KEYS["sleep"]), timeout=5)
+                else:
+                    for _ in range(12):  # wait for a running command to finish
+                        if not run_cli(f"wake ; tune-id {t['uid']}").get("busy"):
+                            break
+                        time.sleep(5)
+
+    threading.Thread(target=timer_loop, daemon=True).start()
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         if not activity and "mWakefulness=" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]:
@@ -3517,7 +3629,20 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                                   "text/plain; charset=utf-8")
             path = urlparse(self.path).path
             if path == "/":
-                self._send(200, WEB_REMOTE_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                self._send(200, WEB_REMOTE_HTML.replace("__TOKEN__", token).encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/manifest.webmanifest":
+                self._send(200, json.dumps({
+                    "name": "Formuler Remote", "short_name": "Remote", "start_url": f"/?t={token}", "scope": "/",
+                    "display": "standalone", "background_color": "#0f1115", "theme_color": "#0f1115",
+                    "icons": [{"src": f"/icon-{n}.png?t={token}", "sizes": f"{n}x{n}", "type": "image/png",
+                               "purpose": "any maskable"} for n in (192, 512)],
+                }).encode("utf-8"), "application/manifest+json")
+            elif path in ("/icon-192.png", "/icon-512.png"):
+                self._send(200, _app_icon(int(path[6:9])), "image/png")
+            elif path == "/api/timers":
+                self._json(timers_list())
+            elif path == "/api/search":
+                self._json(guide_search((parse_qs(urlparse(self.path).query).get("q") or [""])[0]))
             elif path == "/api/countries":
                 self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()],
                             "direct": bool(account), "guide": bool(account and _epg_link())})
@@ -3576,6 +3701,11 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 except (TypeError, ValueError):
                     return self._json({"ok": False, "error": "Bad request"}, 400)
                 self._json(guide_for(ids, start, end))
+            elif path == "/api/timers":
+                if body.get("action") == "cancel":
+                    self._json(timer_cancel(str(body.get("id", ""))))
+                else:
+                    self._json(timer_add(body))
             elif path == "/api/direct":
                 action = body.get("action")
                 if action == "start":
@@ -3613,12 +3743,58 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         _keep_connection = False
 
 
+_ICON_CACHE: dict[int, bytes] = {}
+
+
+def _app_icon(size: int) -> bytes:
+    """Home-screen icon: a blue rounded square with a white play triangle (PNG, no dependencies)."""
+    if size in _ICON_CACHE:
+        return _ICON_CACHE[size]
+    import struct
+    import zlib
+    bg, blue, white = (15, 17, 21), (79, 140, 255), (255, 255, 255)
+    pad, radius = size * 0.18, size * 0.14  # keep inside the maskable safe zone
+    lo, hi = pad, size - pad
+    rows = []
+    for y in range(size):
+        row = bytearray(b"\x00")  # filter: none
+        for x in range(size):
+            cx, cy = x + 0.5, y + 0.5
+            color = bg
+            if lo <= cx <= hi and lo <= cy <= hi:
+                dx = max(lo + radius - cx, 0, cx - (hi - radius))
+                dy = max(lo + radius - cy, 0, cy - (hi - radius))
+                if dx * dx + dy * dy <= radius * radius:
+                    color = blue
+                    # play triangle pointing right, centred slightly right of the middle
+                    tx, ty = (cx - size * 0.40) / (size * 0.27), (cy - size / 2) / (size * 0.17)
+                    if 0 <= tx <= 1 and abs(ty) <= 1 - tx:
+                        color = white
+            row += bytes(color)
+        rows.append(bytes(row))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+    _ICON_CACHE[size] = png
+    return png
+
+
 WEB_REMOTE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="/manifest.webmanifest?t=__TOKEN__">
+<link rel="apple-touch-icon" href="/icon-192.png?t=__TOKEN__">
+<link rel="icon" type="image/png" href="/icon-192.png?t=__TOKEN__">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Remote">
 <title>Formuler Remote</title>
 <style>
 :root {
@@ -3696,6 +3872,14 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .source { margin-bottom: 8px; padding: 6px 10px; border-radius: 10px; font-size: 13px; font-weight: 600; }
 .source.mirror { background: color-mix(in srgb, #f5a524 18%, transparent); color: #f5a524; }
 .source.direct { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.results { display: grid; gap: 6px; margin-top: 8px; max-height: 50vh; overflow-y: auto; }
+.result { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 8px; align-items: center;
+          padding: 8px; background: var(--panel-2); border-radius: 10px; font-size: 13px; }
+.result img { width: 34px; height: 22px; object-fit: contain; }
+.result .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result .m { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result button { padding: 8px 10px; font-size: 12px; }
+.result.live { outline: 1px solid var(--accent); }
 .g-detail { margin-top: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 10px; }
 .g-detail h3 { margin: 0 0 4px; font-size: 15px; }
 .g-detail p { margin: 4px 0; font-size: 13px; }
@@ -3728,6 +3912,9 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
     <div class="row" style="margin-top:10px">
       <button id="watch" class="primary">Mirror TV screen</button>
       <button id="unwatch" disabled>Stop</button>
+    </div>
+    <div id="zap" class="row" style="margin-top:8px" hidden>
+      <button id="zap-prev">‹ Previous channel</button><button id="zap-next">Next channel ›</button>
     </div>
     <p class="hint"><b>Mirror TV screen</b> shows what the TV shows (the TV is muted until Stop).
       <b>Watch here (direct)</b> under Channels plays a channel straight from the IPTV provider, separate from the TV.</p>
@@ -3772,6 +3959,13 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
           <button data-cmd="open prime">Prime Video</button>
         </div>
       </section>
+      <section aria-label="Sleep timer">
+        <h2>Sleep timer</h2>
+        <div id="sleep" class="row">
+          <button data-sleep="30">30 min</button><button data-sleep="60">60 min</button><button data-sleep="90">90 min</button><button data-sleep="0">Off</button>
+        </div>
+        <p id="sleep-hint" class="hint">Puts the box (and the TV, via HDMI-CEC) to sleep and stops streams on this page.</p>
+      </section>
       <section aria-label="Mirror">
         <h2>Mirror to the computer</h2>
         <div class="row">
@@ -3803,6 +3997,16 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
       </section>
     </div>
     <div class="panel stack" data-panel="guide" role="tabpanel">
+      <section aria-label="Search programmes">
+        <h2>Search programmes</h2>
+        <input id="g-search" type="search" placeholder="e.g. voetbal, journaal, Ajax" autocomplete="off" enterkeyhint="search">
+        <div id="g-results" class="results"></div>
+        <p id="g-search-hint" class="hint">Searches titles and descriptions of everything still to come, on the channels of all countries.</p>
+        <div id="scheduled" hidden>
+          <h2 style="margin-top:14px">Scheduled</h2>
+          <div id="scheduled-list" class="results"></div>
+        </div>
+      </section>
       <section aria-label="Guide" id="guide-sec">
         <h2>Guide</h2>
         <div class="row" style="margin-bottom:8px">
@@ -4011,6 +4215,11 @@ function showProgramme(g, s, e, title, desc) {
     b.textContent = target === "here" ? "Watch on this device" : "Watch on TV";
     b.onclick = () => playGroup(g[0], b);
     d.append(b);
+  } else if (s > nowS) {
+    const b = document.createElement("button");
+    b.textContent = `⏰ Tune the TV at ${hm(s)}`;
+    b.onclick = () => scheduleTune(g[0].id, s, `${title} · ${shortName(g[0])}`, b);
+    d.append(b);
   }
   d.hidden = false;
   d.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -4115,7 +4324,7 @@ function detachStream() {
   v.pause(); v.removeAttribute("src"); v.load();
   $("#preview").hidden = true;
 }
-let playing = "";  // "tv" (screen stream) or "direct" (channel from the provider)
+let playing = "", directId = "";  // "tv" (screen stream) or "direct" (channel from the provider)
 let nowTimer;
 async function showNow(id) {
   clearInterval(nowTimer);
@@ -4132,7 +4341,7 @@ async function showNow(id) {
 function stopNow() { clearInterval(nowTimer); $("#now").hidden = true; }
 function setSource(kind, title = "") {
   const el = $("#source");
-  el.hidden = !kind;
+  el.hidden = !kind; $("#zap").hidden = !kind;
   el.className = "source " + (kind || "");
   el.textContent = kind === "direct" ? "📡 Direct from IPTV provider" + (title ? " · " + title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "") : "")
                  : kind === "mirror" ? "📺 Mirror of the TV screen" : "";
@@ -4148,7 +4357,7 @@ async function watchDirect(id, btn) {
       r = await api("/api/direct", { action: "start", id, sleep_box: true });
     }
     if (!r.ok) { toast(r.error || "Channel failed", true); return; }
-    playing = "direct"; setSource("direct", r.title);
+    playing = "direct"; directId = id; setSource("direct", r.title);
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false; $("#watch").disabled = false;
     $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -4185,10 +4394,109 @@ async function refreshState() {
     el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "") + (s.streaming ? " · streaming" : "")
       + (s.direct ? " · direct stream" : "");
     if (s.streaming || s.direct) $("#unwatch").disabled = false;  // also when started from another device
+    loadTimers();
     if (!playing && (s.streaming || s.direct)) { playing = s.direct ? "direct" : "tv"; setSource(s.direct ? "direct" : "mirror", s.direct); }
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }
+// ── Zapping in the player ──
+function zap(step) {
+  if (playing === "tv") return key(step > 0 ? "channel-up" : "channel-down");
+  if (playing !== "direct") return;
+  const i = shownGroups.findIndex(g => g.some(c => c.id === directId));
+  if (i < 0) return toast("This channel isn't in the channel list; pick one there", true);
+  watchDirect(shownGroups[(i + step + shownGroups.length) % shownGroups.length][0].id);
+}
+$("#zap-prev").onclick = () => zap(-1);
+$("#zap-next").onclick = () => zap(1);
+
+// ── Timers (sleep, tune at start) ──
+const whenText = s => {
+  const d = new Date(s * 1000), today = new Date().toDateString() === d.toDateString();
+  return (today ? "" : d.toLocaleDateString([], { weekday: "short" }) + " ") + hm(s);
+};
+function renderTimers(list) {
+  const sleep = list.find(t => t.kind === "sleep");
+  $("#sleep-hint").textContent = sleep
+    ? `The box goes to sleep at ${hm(sleep.at)}.`
+    : "Puts the box (and the TV, via HDMI-CEC) to sleep and stops streams on this page.";
+  const tunes = list.filter(t => t.kind === "tune");
+  $("#scheduled").hidden = !tunes.length;
+  $("#scheduled-list").replaceChildren(...tunes.map(t => {
+    const row = document.createElement("div"); row.className = "result";
+    const icon = document.createElement("span"); icon.textContent = "⏰";
+    const txt = document.createElement("div");
+    const a = document.createElement("div"); a.className = "t"; a.textContent = t.title || t.uid;
+    const b = document.createElement("div"); b.className = "m"; b.textContent = "TV tunes at " + whenText(t.at);
+    txt.append(a, b);
+    const x = document.createElement("button"); x.textContent = "Cancel";
+    x.onclick = async () => renderTimers((await api("/api/timers", { action: "cancel", id: t.id })).timers || []);
+    row.append(icon, txt, x); return row;
+  }));
+}
+async function loadTimers() {
+  const r = await api("/api/timers").catch(() => null);
+  if (r && r.ok) renderTimers(r.timers);
+}
+async function scheduleTune(id, at, title, btn) {
+  const r = await api("/api/timers", { kind: "tune", id, at, title });
+  if (!r.ok) return toast(r.error || "Could not schedule", true);
+  renderTimers(r.timers);
+  if (btn) { btn.disabled = true; btn.textContent = "⏰ Scheduled"; }
+  toast(`The TV tunes to it at ${hm(at)}`);
+}
+$("#sleep").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const minutes = +b.dataset.sleep;
+  let r;
+  if (minutes) r = await api("/api/timers", { kind: "sleep", minutes });
+  else {
+    const t = (await api("/api/timers")).timers.find(t => t.kind === "sleep");
+    r = t ? await api("/api/timers", { action: "cancel", id: t.id }) : { ok: true, timers: [] };
+  }
+  if (!r.ok) return toast(r.error || "Failed", true);
+  renderTimers(r.timers);
+  toast(minutes ? `Sleep in ${minutes} minutes` : "Sleep timer off");
+};
+
+// ── Programme search ──
+let searchTimer;
+$("#g-search").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(searchProgrammes, 400); };
+async function searchProgrammes() {
+  const q = $("#g-search").value.trim(), box = $("#g-results");
+  if (q.length < 2) { box.replaceChildren(); $("#g-search-hint").textContent = "Searches titles and descriptions of everything still to come, on the channels of all countries."; return; }
+  $("#g-search-hint").textContent = "Searching…";
+  const r = await api("/api/search?q=" + encodeURIComponent(q)).catch(() => null);
+  if (q !== $("#g-search").value.trim()) return;  // a newer search is running
+  if (!r || !r.ok) { $("#g-search-hint").textContent = (r && r.error) || "Search failed"; return; }
+  if (r.state !== "ready") { $("#g-search-hint").textContent = "The guide is still loading; try again in a minute."; return; }
+  const nowS = Date.now() / 1000;
+  box.replaceChildren(...r.results.map(p => {
+    const live = p.start <= nowS;
+    const row = document.createElement("div"); row.className = "result" + (live ? " live" : "");
+    const img = document.createElement("img"); img.alt = ""; img.loading = "lazy";
+    if (p.logo) { img.src = p.logo; img.onerror = () => img.style.visibility = "hidden"; } else img.style.visibility = "hidden";
+    const txt = document.createElement("div"); txt.title = p.desc;
+    const a = document.createElement("div"); a.className = "t"; a.textContent = p.title;
+    const b = document.createElement("div"); b.className = "m";
+    b.textContent = (live ? "Now · " : whenText(p.start) + " · ") + shortName({ title: p.channel });
+    txt.append(a, b);
+    const btn = document.createElement("button");
+    if (live) {
+      btn.className = "primary"; btn.textContent = target === "here" ? "Watch" : "Tune";
+      btn.onclick = () => playGroup({ id: p.id }, btn);
+    } else {
+      btn.textContent = "⏰ " + hm(p.start);
+      btn.title = "Tune the TV when it starts";
+      btn.onclick = () => scheduleTune(p.id, p.start, `${p.title} · ${shortName({ title: p.channel })}`, btn);
+    }
+    row.append(img, txt, btn); return row;
+  }));
+  $("#g-search-hint").textContent = r.results.length
+    ? `${r.results.length} programmes` + (r.more ? " (first 80; be more specific for more)" : "") + ". ⏰ tunes the TV when it starts."
+    : "Nothing found in the next day and a half.";
+}
+
 let tab = "remote";
 try { tab = localStorage.getItem("tab") || "remote"; } catch (e) {}
 function showTab(name) {
