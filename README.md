@@ -273,7 +273,7 @@ EOF
 | | `search <query>` | Search local DB + device |
 | | `list [filter]` | List favorites/history |
 | | `list-all [filter]` | List all enumerated channels |
-| | `country [code] [filter]` | List countries, or all live channels of one (`nl be us ca au nz`) |
+| | `country [code] [filter]` | List countries, or all live channels of one (`nl be us ca au nz uk`) |
 | | `tune-id <unique_id>` | Tune by provider channel id (from `country --json`) |
 | | `channel-info <number>` | Show channel details |
 | | `categories` | Show category counts |
@@ -469,7 +469,7 @@ france2 = "France 2 HD"
 
 # Extra countries for 'country' and the web remote: code = [name, [title prefixes]]
 [countries]
-uk = ["United Kingdom", ["UK"]]
+de = ["Duitsland", ["DE"]]
 
 [macros]
 morning = "open mytv; wait 3; tune BFM TV"

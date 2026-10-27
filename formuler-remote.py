@@ -216,6 +216,7 @@ COUNTRIES = {
     "ca": ("Canada", ["CA"]),
     "au": ("Australië", ["AU"]),
     "nz": ("Nieuw-Zeeland", ["NZ"]),
+    "uk": ("Verenigd Koninkrijk", ["UK"]),
 }
 COUNTRIES.update({k.lower(): (v[0], list(v[1])) for k, v in CONFIG.get("countries", {}).items()})
 
@@ -2698,7 +2699,7 @@ HELP_TEXT = f"""
     list [filter]                   list channels (e.g. 'list BE')
     list-all [filter]               list all enumerated channels
     channel-info <number>           show channel details
-    country [code] [filter]         countries, or one country's channels (nl be us ca au nz)
+    country [code] [filter]         countries, or one country's channels (nl be us ca au nz uk)
     tune-id <unique_id>             tune by provider channel id
     categories                      show category counts
 
@@ -3262,7 +3263,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 [ffmpeg, "-hide_banner", "-loglevel", "error", "-follow", "1", "-i", f"file:{mkv}",
                  # scrcpy's MKV leaves the keyframe flag off audio blocks; without
                  # -copyinkf the stream copy drops every audio packet
-                 "-copyinkf", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "15",
+                 "-copyinkf", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
                  "-hls_flags", "delete_segments+omit_endlist+independent_segments",
                  str(d / "hls" / "live.m3u8")],
                 d / "ffmpeg.log")
@@ -3337,11 +3338,10 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             _direct_stop_locked()
             try:
                 active, limit = _connections()
-                if active >= limit and not was_running:
-                    if not sleep_box:
-                        return {"ok": False, "busy": True, "error": (
-                            f"Your IPTV subscription allows {limit} connection(s) and "
-                            f"{'it is' if limit == 1 else 'all are'} in use, probably by the TV.")}
+                # Try even when the subscription looks full: the box and one more often
+                # work together. Only when the stream then fails is it reported as busy.
+                full = active >= limit and not was_running
+                if full and sleep_box:
                     adb(ip, "shell", "input", "keyevent", str(KEYS["sleep"]), timeout=5)
                     deadline = time.time() + 20
                     while time.time() < deadline and _connections()[0] >= limit:
@@ -3377,7 +3377,11 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             except OSError:
                 err = []
             _direct_stop_locked()
-            return {"ok": False, "error": _redact("Channel did not start: " + (err[0] if err else "no data from the provider"))}
+            msg = "Channel did not start: " + (err[0] if err else "no data from the provider")
+            if full and not sleep_box:
+                return {"ok": False, "busy": True, "error": _redact(
+                    f"{msg}. Your IPTV subscription allows {limit} connection(s) and the TV is probably using it.")}
+            return {"ok": False, "error": _redact(msg)}
 
     def direct_stop() -> dict:
         with direct_lock:
@@ -3689,6 +3693,9 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .g-p.now { border-color: var(--accent); }
 .g-p.past { opacity: .55; }
 .g-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--err); z-index: 1; pointer-events: none; }
+.source { margin-bottom: 8px; padding: 6px 10px; border-radius: 10px; font-size: 13px; font-weight: 600; }
+.source.mirror { background: color-mix(in srgb, #f5a524 18%, transparent); color: #f5a524; }
+.source.direct { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
 .g-detail { margin-top: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 10px; }
 .g-detail h3 { margin: 0 0 4px; font-size: 15px; }
 .g-detail p { margin: 4px 0; font-size: 13px; }
@@ -3715,14 +3722,15 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 <main>
   <section aria-label="Watch" class="watch">
     <h2>Watch here</h2>
+    <div id="source" class="source" hidden></div>
     <div id="preview" class="preview" hidden><video id="live" playsinline controls></video></div>
     <p id="now" class="hint" hidden></p>
     <div class="row" style="margin-top:10px">
-      <button id="watch" class="primary">Watch TV screen</button>
+      <button id="watch" class="primary">Mirror TV screen</button>
       <button id="unwatch" disabled>Stop</button>
     </div>
-    <p class="hint">Shows the TV screen here, a few seconds behind; the TV is muted until Stop.
-      For a channel without the TV, use “Play on this device” under Channels.</p>
+    <p class="hint"><b>Mirror TV screen</b> shows what the TV shows (the TV is muted until Stop).
+      <b>Watch here (direct)</b> under Channels plays a channel straight from the IPTV provider, separate from the TV.</p>
   </section>
   <div class="stack">
     <nav id="tabs" class="tabs" role="tablist" aria-label="Sections">
@@ -3777,7 +3785,7 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
       <section aria-label="Channels">
         <h2>Channels</h2>
         <div id="target" class="chips" aria-label="Play on" hidden>
-          <button data-target="tv" aria-pressed="true">Play on TV</button><button data-target="here" aria-pressed="false">Play on this device</button>
+          <button data-target="tv" aria-pressed="true">📺 Tune the TV</button><button data-target="here" aria-pressed="false">📡 Watch here (direct)</button>
         </div>
         <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
         <div id="kinds" class="chips" aria-label="Type">
@@ -4081,12 +4089,13 @@ async function attachStream(url) {
   // Fall back to native HLS for browsers without MSE (older iPhones).
   if (!window.Hls) await loadScript("https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js").catch(() => {});
   if (window.Hls && Hls.isSupported()) {
-    // Stay a few segments behind the live edge so a late segment doesn't stall playback
-    // (provider segments are ~4s and arrive unevenly); no speed-up to catch up, which
-    // makes the sound waver; jump back only when far behind.
-    const behind = url.includes("/direct/") ? 3 : 4;
-    hls = new Hls({ liveSyncDurationCount: behind, liveMaxLatencyDurationCount: behind + 6,
-                    maxLiveSyncPlaybackRate: 1, maxBufferLength: 30, backBufferLength: 30 });
+    // Provider segments are ~4s and arrive unevenly: stay 3 segments behind the live edge
+    // and don't speed up to catch up. The TV-screen stream is local and steady (1s
+    // segments) and sounded clean with these settings; trimming its back buffer every
+    // second made the audio crackle on Android.
+    hls = new Hls(url.includes("/direct/")
+      ? { liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 9, maxLiveSyncPlaybackRate: 1, maxBufferLength: 30 }
+      : { liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxLiveSyncPlaybackRate: 1.2 });
     hls.on(Hls.Events.ERROR, (_, d) => {
       if (!d.fatal) return;
       if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
@@ -4121,18 +4130,25 @@ async function showNow(id) {
   await update(); nowTimer = setInterval(update, 60000);
 }
 function stopNow() { clearInterval(nowTimer); $("#now").hidden = true; }
+function setSource(kind, title = "") {
+  const el = $("#source");
+  el.hidden = !kind;
+  el.className = "source " + (kind || "");
+  el.textContent = kind === "direct" ? "📡 Direct from IPTV provider" + (title ? " · " + title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "") : "")
+                 : kind === "mirror" ? "📺 Mirror of the TV screen" : "";
+}
 async function watchDirect(id, btn) {
   if (btn) btn.disabled = true;
   detachStream(); stopNow();
   toast("Starting channel… (about 10 seconds)");
   try {
     let r = await api("/api/direct", { action: "start", id });
-    if (!r.ok && r.busy && confirm(r.error + "\n\nPut the TV to sleep and watch here?")) {
+    if (!r.ok && r.busy && confirm(r.error + "\n\nPut the TV to sleep and try again?")) {
       toast("Putting the TV to sleep and starting the channel…");
       r = await api("/api/direct", { action: "start", id, sleep_box: true });
     }
     if (!r.ok) { toast(r.error || "Channel failed", true); return; }
-    playing = "direct";
+    playing = "direct"; setSource("direct", r.title);
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false; $("#watch").disabled = false;
     $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -4148,14 +4164,14 @@ $("#watch").onclick = async () => {
   try {
     const r = await api("/api/stream", { action: "start" });
     if (!r.ok) { toast(r.error || "Stream failed", true); b.disabled = false; return; }
-    playing = "tv";
+    playing = "tv"; setSource("mirror");
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false;
     toast("Streaming. The TV is muted until you press Stop.");
   } catch (e) { toast(e.message || "Stream failed", true); b.disabled = false; }
 };
 $("#unwatch").onclick = async () => {
-  detachStream(); stopNow();
+  detachStream(); stopNow(); setSource("");
   await api(playing === "direct" ? "/api/direct" : "/api/stream", { action: "stop" });
   toast(playing === "direct" ? "Channel stopped" : "Stream stopped, sound is back on the TV");
   playing = "";
@@ -4167,9 +4183,9 @@ async function refreshState() {
     const el = $("#state");
     const label = s.activity === "LiveActivity" ? "Live TV" : (s.activity || "Offline").replace(/Activity$/, "");
     el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "") + (s.streaming ? " · streaming" : "")
-      + (s.direct ? " · on device" : "");
+      + (s.direct ? " · direct stream" : "");
     if (s.streaming || s.direct) $("#unwatch").disabled = false;  // also when started from another device
-    if (!playing && (s.streaming || s.direct)) playing = s.direct ? "direct" : "tv";
+    if (!playing && (s.streaming || s.direct)) { playing = s.direct ? "direct" : "tv"; setSource(s.direct ? "direct" : "mirror", s.direct); }
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }
