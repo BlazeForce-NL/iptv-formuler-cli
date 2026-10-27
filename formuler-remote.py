@@ -3262,7 +3262,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 [ffmpeg, "-hide_banner", "-loglevel", "error", "-follow", "1", "-i", f"file:{mkv}",
                  # scrcpy's MKV leaves the keyframe flag off audio blocks; without
                  # -copyinkf the stream copy drops every audio packet
-                 "-copyinkf", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
+                 "-copyinkf", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_list_size", "15",
                  "-hls_flags", "delete_segments+omit_endlist+independent_segments",
                  str(d / "hls" / "live.m3u8")],
                 d / "ffmpeg.log")
@@ -3359,7 +3359,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                     "-i", f"{server}/live/{user}/{password}/{sid}.ts",
                     "-map", "0:v:0", "-map", "0:a:0?", *video, "-c:a", "aac", "-b:a", "128k",
-                    "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+                    "-f", "hls", "-hls_time", "2", "-hls_list_size", "10",
                     "-hls_flags", "delete_segments+omit_endlist+independent_segments",
                     str(d / "live.m3u8")]
             extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
@@ -3636,7 +3636,13 @@ header h1 { font-size: 17px; margin: 0; flex: 1; }
 .pill { font-size: 12px; padding: 4px 10px; border-radius: 99px; background: var(--panel-2); color: var(--muted); }
 .pill.on { color: var(--ok); }
 main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
-@media (min-width: 900px) { main { grid-template-columns: 380px minmax(0, 1fr); align-items: start; } }
+@media (min-width: 900px) {
+  main { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); align-items: start; }
+  .watch { position: sticky; top: 70px; }
+}
+.tabs { display: flex; gap: 6px; position: sticky; top: 53px; z-index: 4; padding: 6px 0; background: var(--bg); }
+.tabs button { flex: 1; padding: 10px 4px; font-size: 14px; }
+.tabs button[aria-selected="true"] { background: var(--accent); border-color: var(--accent-2); color: #fff; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
 section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; }
 button { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
@@ -3662,7 +3668,7 @@ label.toggle { display: flex; align-items: center; gap: 8px; color: var(--muted)
 input, select { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
                 border-radius: 10px; padding: 10px 12px; width: 100%; min-width: 0; }
 .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
-            max-height: 360px; overflow-y: auto; margin-top: 10px; padding-right: 2px; }
+            max-height: 62vh; overflow-y: auto; margin-top: 10px; padding-right: 2px; }
 .chips { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 8px; scrollbar-width: none; }
 .chips button { flex: none; padding: 6px 12px; border-radius: 99px; font-size: 13px; }
 .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-2); color: #fff; }
@@ -3707,119 +3713,115 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
   <span id="state" class="pill">…</span>
 </header>
 <main>
+  <section aria-label="Watch" class="watch">
+    <h2>Watch here</h2>
+    <div id="preview" class="preview" hidden><video id="live" playsinline controls></video></div>
+    <p id="now" class="hint" hidden></p>
+    <div class="row" style="margin-top:10px">
+      <button id="watch" class="primary">Watch TV screen</button>
+      <button id="unwatch" disabled>Stop</button>
+    </div>
+    <p class="hint">Shows the TV screen here, a few seconds behind; the TV is muted until Stop.
+      For a channel without the TV, use “Play on this device” under Channels.</p>
+  </section>
   <div class="stack">
-    <section aria-label="Remote">
-      <h2>Remote</h2>
-      <div class="row" style="margin-bottom:12px">
-        <button data-cmd="wake">Power on</button>
-        <button data-cmd="power-off">Power off</button>
-      </div>
-      <div class="dpad">
-        <span></span><button data-key="up" aria-label="Up">▲</button><span></span>
-        <button data-key="left" aria-label="Left">◀</button>
-        <button data-key="ok" class="ok">OK</button>
-        <button data-key="right" aria-label="Right">▶</button>
-        <span></span><button data-key="down" aria-label="Down">▼</button><span></span>
-      </div>
-      <div class="row">
-        <button data-key="back">Back</button>
-        <button data-key="home">Home</button>
-        <button data-key="menu">Menu</button>
-      </div>
-      <div class="rockers">
-        <div class="rocker"><button data-key="volume-up">＋</button><span>Volume</span><button data-key="volume-down">－</button></div>
-        <div class="rocker"><button data-key="mute">Mute</button><button data-key="play-pause">⏯</button><button data-key="info">Info</button></div>
-        <div class="rocker"><button data-key="channel-up">＋</button><span>Channel</span><button data-key="channel-down">－</button></div>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <button data-cmd="prev">Previous ch.</button>
-        <button data-cmd="guide">Guide</button>
-      </div>
-    </section>
-
-    <section aria-label="Apps">
-      <h2>Apps</h2>
-      <div class="row">
-        <button data-cmd="open mytv">MyTVOnline</button>
-        <button data-cmd="open youtube">YouTube</button>
-        <button data-cmd="open prime">Prime Video</button>
-      </div>
-    </section>
-  </div>
-
-  <div class="stack">
-    <section aria-label="Watch">
-      <h2>Watch here</h2>
-      <div class="preview"><video id="live" playsinline controls hidden></video>
-        <div id="live-empty" class="empty">Stream the TV picture and sound to this device</div></div>
-      <p id="now" class="hint" hidden></p>
-      <div class="row" style="margin-top:10px">
-        <button id="watch" class="primary">Watch here</button>
-        <button id="unwatch" disabled>Stop</button>
-      </div>
-      <p class="hint">Runs a few seconds behind the TV. On this box (Android 11) the TV is muted while streaming; Stop gives the sound back.
-        Channels picked with “Play on this device” come straight from the IPTV provider and leave the TV alone.</p>
-    </section>
-
-    <section aria-label="Screen">
-      <h2>Screen</h2>
-      <div class="preview"><img id="shot" alt="TV screen" hidden><div id="shot-empty" class="empty">No screenshot yet</div></div>
-      <div class="row" style="margin-top:10px; align-items:center">
-        <button id="refresh">Refresh</button>
-        <label class="toggle"><input id="auto" type="checkbox" style="width:auto"> Auto (5 s)</label>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <button data-cmd="mirror">Mirror (sound on laptop)</button>
-        <button data-cmd="mirror --no-audio">Mirror (sound on TV)</button>
-      </div>
-      <p class="hint">Mirroring opens a window on the computer running the server.</p>
-    </section>
-
-    <section aria-label="Channels">
-      <h2>Channels</h2>
-      <div id="target" class="chips" aria-label="Play on" hidden>
-        <button data-target="tv" aria-pressed="true">Play on TV</button><button data-target="here" aria-pressed="false">Play on this device</button>
-      </div>
-      <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
-      <div id="kinds" class="chips" aria-label="Type">
-        <button data-kind="" aria-pressed="true">All</button><button data-kind="tv" aria-pressed="false">TV</button>
-        <button data-kind="24/7" aria-pressed="false">24/7</button><button data-kind="events" aria-pressed="false">Events</button>
-        <button data-kind="radio" aria-pressed="false">Radio</button>
-      </div>
-      <input id="filter" type="search" placeholder="Filter channels (e.g. NPO, sport, 42)" autocomplete="off">
-      <div id="channels" class="channels"></div>
-      <div class="row" style="margin-top:8px; align-items:center">
-        <p id="ch-hint" class="hint" style="margin:0"></p>
-        <label class="toggle" style="flex:none"><input id="variants" type="checkbox" style="width:auto"> All variants</label>
-      </div>
-      <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.</p>
-    </section>
-
-    <section aria-label="Guide" id="guide-sec" hidden>
-      <h2>Guide</h2>
-      <div class="row" style="margin-bottom:8px">
-        <button id="g-prev">‹ Earlier</button><button id="g-now">Now</button><button id="g-next">Later ›</button>
-      </div>
-      <div id="guide" class="guide"></div>
-      <div id="g-detail" class="g-detail" hidden></div>
-      <div class="row" style="margin-top:8px; align-items:center">
-        <p id="g-hint" class="hint" style="margin:0"></p>
-        <button id="g-more" style="flex:none" hidden>More channels</button>
-      </div>
-      <p class="hint">Follows the country, type and filter of the channel list. Tap a programme for details.</p>
-    </section>
-
-    <section aria-label="Play">
-      <h2>Play a series or movie</h2>
-      <div class="form">
-        <select id="kind" class="full"><option value="series">Series</option><option value="movie">Movie</option></select>
-        <input id="title" placeholder="Title, e.g. below deck adventure">
-        <input id="season" type="number" min="1" value="1" aria-label="Season">
-        <input id="episode" type="number" min="1" value="1" aria-label="Episode">
-        <button id="play" class="primary full">Play</button>
-      </div>
-      <p class="hint">Searching and starting can take 1–2 minutes. Playback is checked before it reports success.</p>
-    </section>
+    <nav id="tabs" class="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" data-tab="remote">Remote</button><button role="tab" data-tab="channels">Channels</button><button role="tab" data-tab="guide" hidden>Guide</button><button role="tab" data-tab="play">Movies</button>
+    </nav>
+    <div class="panel stack" data-panel="remote" role="tabpanel">
+      <section aria-label="Remote">
+        <div class="row" style="margin-bottom:12px">
+          <button data-cmd="wake">Power on</button>
+          <button data-cmd="power-off">Power off</button>
+        </div>
+        <div class="dpad">
+          <span></span><button data-key="up" aria-label="Up">▲</button><span></span>
+          <button data-key="left" aria-label="Left">◀</button>
+          <button data-key="ok" class="ok">OK</button>
+          <button data-key="right" aria-label="Right">▶</button>
+          <span></span><button data-key="down" aria-label="Down">▼</button><span></span>
+        </div>
+        <div class="row">
+          <button data-key="back">Back</button>
+          <button data-key="home">Home</button>
+          <button data-key="menu">Menu</button>
+        </div>
+        <div class="rockers">
+          <div class="rocker"><button data-key="volume-up">＋</button><span>Volume</span><button data-key="volume-down">－</button></div>
+          <div class="rocker"><button data-key="mute">Mute</button><button data-key="play-pause">⏯</button><button data-key="info">Info</button></div>
+          <div class="rocker"><button data-key="channel-up">＋</button><span>Channel</span><button data-key="channel-down">－</button></div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button data-cmd="prev">Previous ch.</button>
+          <button data-cmd="guide">Guide</button>
+        </div>
+      </section>
+      <section aria-label="Apps">
+        <h2>Apps</h2>
+        <div class="row">
+          <button data-cmd="open mytv">MyTVOnline</button>
+          <button data-cmd="open youtube">YouTube</button>
+          <button data-cmd="open prime">Prime Video</button>
+        </div>
+      </section>
+      <section aria-label="Mirror">
+        <h2>Mirror to the computer</h2>
+        <div class="row">
+          <button data-cmd="mirror">Sound on laptop</button>
+          <button data-cmd="mirror --no-audio">Sound on TV</button>
+        </div>
+        <p class="hint">Opens a window on the computer running the server.</p>
+      </section>
+    </div>
+    <div class="panel stack" data-panel="channels" role="tabpanel">
+      <section aria-label="Channels">
+        <h2>Channels</h2>
+        <div id="target" class="chips" aria-label="Play on" hidden>
+          <button data-target="tv" aria-pressed="true">Play on TV</button><button data-target="here" aria-pressed="false">Play on this device</button>
+        </div>
+        <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
+        <div id="kinds" class="chips" aria-label="Type">
+          <button data-kind="" aria-pressed="true">All</button><button data-kind="tv" aria-pressed="false">TV</button>
+          <button data-kind="24/7" aria-pressed="false">24/7</button><button data-kind="events" aria-pressed="false">Events</button>
+          <button data-kind="radio" aria-pressed="false">Radio</button>
+        </div>
+        <input id="filter" type="search" placeholder="Filter channels (e.g. NPO, sport, 42)" autocomplete="off">
+        <div id="channels" class="channels"></div>
+        <div class="row" style="margin-top:8px; align-items:center">
+          <p id="ch-hint" class="hint" style="margin:0"></p>
+          <label class="toggle" style="flex:none"><input id="variants" type="checkbox" style="width:auto"> All variants</label>
+        </div>
+        <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.</p>
+      </section>
+    </div>
+    <div class="panel stack" data-panel="guide" role="tabpanel">
+      <section aria-label="Guide" id="guide-sec">
+        <h2>Guide</h2>
+        <div class="row" style="margin-bottom:8px">
+          <button id="g-prev">‹ Earlier</button><button id="g-now">Now</button><button id="g-next">Later ›</button>
+        </div>
+        <div id="guide" class="guide"></div>
+        <div id="g-detail" class="g-detail" hidden></div>
+        <div class="row" style="margin-top:8px; align-items:center">
+          <p id="g-hint" class="hint" style="margin:0"></p>
+          <button id="g-more" style="flex:none" hidden>More channels</button>
+        </div>
+        <p class="hint">Follows the country, type and filter of the channel list. Tap a programme for details.</p>
+      </section>
+    </div>
+    <div class="panel stack" data-panel="play" role="tabpanel">
+      <section aria-label="Play">
+        <h2>Play a series or movie</h2>
+        <div class="form">
+          <select id="kind" class="full"><option value="series">Series</option><option value="movie">Movie</option></select>
+          <input id="title" placeholder="Title, e.g. below deck adventure">
+          <input id="season" type="number" min="1" value="1" aria-label="Season">
+          <input id="episode" type="number" min="1" value="1" aria-label="Episode">
+          <button id="play" class="primary full">Play</button>
+        </div>
+        <p class="hint">Searching and starting can take 1–2 minutes. Playback is checked before it reports success.</p>
+      </section>
+    </div>
   </div>
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
@@ -3850,7 +3852,6 @@ async function run(cmd, btn) {
     const r = await api("/api/cmd", { cmd });
     if (r.ok) toast((r.messages || []).slice(-1)[0] || "Done");
     else toast(r.error || "Failed", true);
-    setTimeout(refreshShot, 1500);
     return r;
   } catch (e) { toast("Server unreachable", true); }
   finally { if (btn) btn.disabled = false; }
@@ -3869,20 +3870,6 @@ document.addEventListener("keydown", (e) => {
                 "+": "volume-up", "-": "volume-down", PageUp: "channel-up", PageDown: "channel-down" };
   if (map[e.key]) { e.preventDefault(); key(map[e.key]); }
 });
-async function refreshShot() {
-  const r = await fetch("/api/screenshot", { headers: { "X-Token": token } });
-  if (!r.ok) return;
-  const url = URL.createObjectURL(await r.blob());
-  const img = $("#shot"); const old = img.src;
-  img.src = url; img.hidden = false; $("#shot-empty").hidden = true;
-  if (old.startsWith("blob:")) URL.revokeObjectURL(old);
-}
-$("#refresh").onclick = refreshShot;
-let autoTimer;
-$("#auto").onchange = (e) => {
-  clearInterval(autoTimer);
-  if (e.target.checked) { refreshShot(); autoTimer = setInterval(refreshShot, 5000); }
-};
 let allChannels = [], country = "nl", kind = "", target = "tv";
 try { country = localStorage.getItem("country") || "nl"; target = localStorage.getItem("target") || "tv"; } catch (e) {}
 const QUALITY = /\s*\b(ULTRA\s+)?(4K|UHD|FHD|HD|HEVC|H265|SD|LQ|HQ|50FPS)\b|[ᴬ-ᵡ◉²]+/gi;
@@ -3938,7 +3925,7 @@ const PX = 3, CH_W = 96, SPAN = 6 * 3600;  // 3 px per minute, 6 hours per view
 const halfHour = t => Math.floor(t / 1800) * 1800;
 const hm = s => new Date(s * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 const shortName = c => c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "").replace(QUALITY, "").trim() || c.title;
-function scheduleGuide() { clearTimeout(guideTimer); if (guideOn) guideTimer = setTimeout(renderGuide, 300); }
+function scheduleGuide() { clearTimeout(guideTimer); if (guideOn && tab === "guide") guideTimer = setTimeout(renderGuide, 300); }
 async function renderGuide() {
   clearTimeout(guideTimer);
   if (!guideOn) return;
@@ -4024,7 +4011,7 @@ $("#g-prev").onclick = () => { const nowS = Date.now() / 1000; guideFrom = Math.
 $("#g-next").onclick = () => { const nowS = Date.now() / 1000; guideFrom = Math.min((guideFrom || halfHour(nowS - 1800)) + 3 * 3600, halfHour(nowS + 30 * 3600)); renderGuide(); };
 $("#g-now").onclick = () => { guideFrom = 0; renderGuide(); };
 $("#g-more").onclick = () => { guideCount += 40; renderGuide(); };
-setInterval(() => { if (guideOn && !document.hidden) renderGuide(); }, 300000);  // moves the "now" line
+setInterval(() => { if (guideOn && tab === "guide" && !document.hidden) renderGuide(); }, 300000);  // moves the "now" line
 $("#filter").oninput = renderChannels;
 $("#variants").onchange = renderChannels;
 $("#kinds").onclick = (e) => {
@@ -4046,7 +4033,8 @@ async function loadCountries() {
   const r = await api("/api/countries");
   const list = r.countries || [];
   $("#target").hidden = !r.direct;
-  guideOn = !!r.guide; $("#guide-sec").hidden = !guideOn;
+  guideOn = !!r.guide; $('#tabs [data-tab="guide"]').hidden = !guideOn;
+  if (!guideOn && tab === "guide") showTab("remote");
   if (!r.direct) target = "tv";
   for (const b of $("#target").children) b.setAttribute("aria-pressed", String(b.dataset.target === target));
   if (!list.some(c => c.code === country)) country = list[0]?.code || "nl";
@@ -4088,12 +4076,22 @@ function loadScript(src) {
 }
 async function attachStream(url) {
   const v = $("#live");
-  v.hidden = false; $("#live-empty").hidden = true;
+  $("#preview").hidden = false;
   // Prefer hls.js (MSE): Chrome's experimental native HLS stalls on this live stream.
   // Fall back to native HLS for browsers without MSE (older iPhones).
   if (!window.Hls) await loadScript("https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js").catch(() => {});
   if (window.Hls && Hls.isSupported()) {
-    hls = new Hls({ liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxLiveSyncPlaybackRate: 1.2 });
+    // Stay a few segments behind the live edge so a late segment doesn't stall playback
+    // (provider segments are ~4s and arrive unevenly); no speed-up to catch up, which
+    // makes the sound waver; jump back only when far behind.
+    const behind = url.includes("/direct/") ? 3 : 4;
+    hls = new Hls({ liveSyncDurationCount: behind, liveMaxLatencyDurationCount: behind + 6,
+                    maxLiveSyncPlaybackRate: 1, maxBufferLength: 30, backBufferLength: 30 });
+    hls.on(Hls.Events.ERROR, (_, d) => {
+      if (!d.fatal) return;
+      if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else setTimeout(() => hls && hls.startLoad(), 1000);
+    });
     hls.loadSource(url); hls.attachMedia(v);
   } else if (v.canPlayType("application/vnd.apple.mpegurl")) {
     v.src = url;
@@ -4106,7 +4104,7 @@ function detachStream() {
   const v = $("#live");
   if (hls) { hls.destroy(); hls = null; }
   v.pause(); v.removeAttribute("src"); v.load();
-  v.hidden = true; $("#live-empty").hidden = false;
+  $("#preview").hidden = true;
 }
 let playing = "";  // "tv" (screen stream) or "direct" (channel from the provider)
 let nowTimer;
@@ -4137,7 +4135,7 @@ async function watchDirect(id, btn) {
     playing = "direct";
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false; $("#watch").disabled = false;
-    $("#live").scrollIntoView({ behavior: "smooth", block: "center" });
+    $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
     toast("Playing " + r.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, ""));
     showNow(id);
   } catch (e) { toast(e.message || "Channel failed", true); }
@@ -4175,6 +4173,17 @@ async function refreshState() {
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }
+let tab = "remote";
+try { tab = localStorage.getItem("tab") || "remote"; } catch (e) {}
+function showTab(name) {
+  tab = name;
+  try { localStorage.setItem("tab", name); } catch (e) {}
+  for (const b of $("#tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === name));
+  for (const p of document.querySelectorAll("[data-panel]")) p.hidden = p.dataset.panel !== name;
+  if (name === "guide") { guideScrolled = -1; renderGuide(); }  // scrolling to "now" needs a visible grid
+}
+$("#tabs").onclick = (e) => { const b = e.target.closest("button"); if (b) showTab(b.dataset.tab); };
+showTab(tab);
 loadCountries(); refreshState(); setInterval(refreshState, 10000);
 </script>
 </body>
