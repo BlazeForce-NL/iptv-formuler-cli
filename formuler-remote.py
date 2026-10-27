@@ -3462,8 +3462,8 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             out[uid] = [p for p in progs if p[1] > start and p[0] < end]
         return {"ok": True, "state": "ready", "channels": out}
 
-    def guide_search(query: str) -> dict:
-        """Upcoming programmes whose title (or description) matches, on channels of the countries."""
+    def guide_search(query: str, when: str = "") -> dict:
+        """Programmes on now and/or later whose title (or description) matches, on the countries' channels."""
         if guide["state"] != "ready":
             return {"ok": guide["state"] != "error", "state": guide["state"], "error": guide["error"] or None, "results": []}
         needle = _normalize(query)
@@ -3487,7 +3487,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         hits = []
         for epg_id, (_, c) in chans.items():
             for s, e, title, desc in guide["progs"].get(epg_id, []):
-                if e <= now:
+                if e <= now or (when == "now" and s > now) or (when == "later" and s <= now):
                     continue
                 in_title = needle in _normalize(title)
                 if in_title or needle in _normalize(desc):
@@ -3642,7 +3642,8 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             elif path == "/api/timers":
                 self._json(timers_list())
             elif path == "/api/search":
-                self._json(guide_search((parse_qs(urlparse(self.path).query).get("q") or [""])[0]))
+                q = parse_qs(urlparse(self.path).query)
+                self._json(guide_search((q.get("q") or [""])[0], (q.get("when") or [""])[0]))
             elif path == "/api/countries":
                 self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()],
                             "direct": bool(account), "guide": bool(account and _epg_link())})
@@ -3880,6 +3881,12 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .result .m { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .result button { padding: 8px 10px; font-size: 12px; }
 .result.live { outline: 1px solid var(--accent); }
+.mode { grid-column: 1 / -1; display: flex; gap: 6px; padding: 4px; background: var(--panel);
+        border: 1px solid var(--line); border-radius: var(--radius); }
+.mode button { flex: 1; display: grid; gap: 2px; padding: 10px 8px; border: 0; background: transparent; font-weight: 600; }
+.mode button small { font-weight: 400; font-size: 11px; color: var(--muted); }
+.mode button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.mode button[aria-pressed="true"] small { color: rgba(255, 255, 255, .8); }
 .g-detail { margin-top: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 10px; }
 .g-detail h3 { margin: 0 0 4px; font-size: 15px; }
 .g-detail p { margin: 4px 0; font-size: 13px; }
@@ -3904,24 +3911,27 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
   <span id="state" class="pill">…</span>
 </header>
 <main>
+  <div id="target" class="mode" role="group" aria-label="Watch via" hidden>
+    <button data-target="here" aria-pressed="false">📡 IPTV direct<small>on this phone, TV stays free</small></button><button data-target="tv" aria-pressed="true">📺 TV<small>Formuler box + remote</small></button>
+  </div>
   <section aria-label="Watch" class="watch">
     <h2>Watch here</h2>
     <div id="source" class="source" hidden></div>
     <div id="preview" class="preview" hidden><video id="live" playsinline controls></video></div>
     <p id="now" class="hint" hidden></p>
     <div class="row" style="margin-top:10px">
-      <button id="watch" class="primary">Mirror TV screen</button>
+      <button id="watch" class="primary" data-mode="tv">Mirror TV screen</button>
       <button id="unwatch" disabled>Stop</button>
     </div>
     <div id="zap" class="row" style="margin-top:8px" hidden>
       <button id="zap-prev">‹ Previous channel</button><button id="zap-next">Next channel ›</button>
     </div>
-    <p class="hint"><b>Mirror TV screen</b> shows what the TV shows (the TV is muted until Stop).
-      <b>Watch here (direct)</b> under Channels plays a channel straight from the IPTV provider, separate from the TV.</p>
+    <p class="hint" data-mode="tv">Channels and the guide tune the TV. <b>Mirror TV screen</b> shows what the TV shows here (the TV is muted until Stop).</p>
+    <p class="hint" data-mode="here" hidden>Pick a channel under Channels or in the Guide: it plays here straight from the IPTV provider, the TV is left alone.</p>
   </section>
   <div class="stack">
     <nav id="tabs" class="tabs" role="tablist" aria-label="Sections">
-      <button role="tab" data-tab="remote">Remote</button><button role="tab" data-tab="channels">Channels</button><button role="tab" data-tab="guide" hidden>Guide</button><button role="tab" data-tab="play">Movies</button>
+      <button role="tab" data-tab="remote" data-mode="tv">Remote</button><button role="tab" data-tab="channels">Channels</button><button role="tab" data-tab="guide" hidden>Guide</button><button role="tab" data-tab="play" data-mode="tv">Movies</button>
     </nav>
     <div class="panel stack" data-panel="remote" role="tabpanel">
       <section aria-label="Remote">
@@ -3978,9 +3988,6 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
     <div class="panel stack" data-panel="channels" role="tabpanel">
       <section aria-label="Channels">
         <h2>Channels</h2>
-        <div id="target" class="chips" aria-label="Play on" hidden>
-          <button data-target="tv" aria-pressed="true">📺 Tune the TV</button><button data-target="here" aria-pressed="false">📡 Watch here (direct)</button>
-        </div>
         <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
         <div id="kinds" class="chips" aria-label="Type">
           <button data-kind="" aria-pressed="true">All</button><button data-kind="tv" aria-pressed="false">TV</button>
@@ -4000,6 +4007,9 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
       <section aria-label="Search programmes">
         <h2>Search programmes</h2>
         <input id="g-search" type="search" placeholder="e.g. voetbal, journaal, Ajax" autocomplete="off" enterkeyhint="search">
+        <div id="g-when" class="chips" style="margin:8px 0 0">
+          <button data-when="" aria-pressed="true">Now &amp; later</button><button data-when="now" aria-pressed="false">On now</button><button data-when="later" aria-pressed="false">Later</button>
+        </div>
         <div id="g-results" class="results"></div>
         <p id="g-search-hint" class="hint">Searches titles and descriptions of everything still to come, on the channels of all countries.</p>
         <div id="scheduled" hidden>
@@ -4251,9 +4261,9 @@ async function loadCountries() {
   const list = r.countries || [];
   $("#target").hidden = !r.direct;
   guideOn = !!r.guide; $('#tabs [data-tab="guide"]').hidden = !guideOn;
-  if (!guideOn && tab === "guide") showTab("remote");
+  if (!guideOn && tab === "guide") showTab("channels");
   if (!r.direct) target = "tv";
-  for (const b of $("#target").children) b.setAttribute("aria-pressed", String(b.dataset.target === target));
+  applyMode();
   if (!list.some(c => c.code === country)) country = list[0]?.code || "nl";
   $("#countries").replaceChildren(...list.map(c => {
     const b = document.createElement("button");
@@ -4267,12 +4277,19 @@ $("#countries").onclick = (e) => {
   try { localStorage.setItem("country", country); } catch (err) {}
   loadChannels();
 };
+function applyMode() {
+  for (const b of $("#target").children) b.setAttribute("aria-pressed", String(b.dataset.target === target));
+  for (const el of document.querySelectorAll("[data-mode]")) el.hidden = el.dataset.mode !== target;
+  if ($(`#tabs [data-tab="${tab}"]`).hidden) showTab("channels");
+  renderChannels();
+}
 $("#target").onclick = (e) => {
-  const b = e.target.closest("button"); if (!b) return;
+  const b = e.target.closest("button"); if (!b || b.dataset.target === target) return;
   target = b.dataset.target;
   try { localStorage.setItem("target", target); } catch (err) {}
-  for (const k of $("#target").children) k.setAttribute("aria-pressed", String(k === b));
-  renderChannels();
+  // what plays on the page belongs to the other mode: stop it (gives the TV its sound back)
+  if ((playing === "tv" && target === "here") || (playing === "direct" && target === "tv")) $("#unwatch").click();
+  applyMode();
 };
 $("#play").onclick = () => {
   const title = $("#title").value.trim();
@@ -4460,13 +4477,19 @@ $("#sleep").onclick = async (e) => {
 };
 
 // ── Programme search ──
-let searchTimer;
+let searchTimer, searchWhen = "";
+$("#g-when").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  searchWhen = b.dataset.when;
+  for (const k of $("#g-when").children) k.setAttribute("aria-pressed", String(k === b));
+  searchProgrammes();
+};
 $("#g-search").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(searchProgrammes, 400); };
 async function searchProgrammes() {
   const q = $("#g-search").value.trim(), box = $("#g-results");
   if (q.length < 2) { box.replaceChildren(); $("#g-search-hint").textContent = "Searches titles and descriptions of everything still to come, on the channels of all countries."; return; }
   $("#g-search-hint").textContent = "Searching…";
-  const r = await api("/api/search?q=" + encodeURIComponent(q)).catch(() => null);
+  const r = await api("/api/search?q=" + encodeURIComponent(q) + "&when=" + searchWhen).catch(() => null);
   if (q !== $("#g-search").value.trim()) return;  // a newer search is running
   if (!r || !r.ok) { $("#g-search-hint").textContent = (r && r.error) || "Search failed"; return; }
   if (r.state !== "ready") { $("#g-search-hint").textContent = "The guide is still loading; try again in a minute."; return; }
@@ -4494,7 +4517,7 @@ async function searchProgrammes() {
   }));
   $("#g-search-hint").textContent = r.results.length
     ? `${r.results.length} programmes` + (r.more ? " (first 80; be more specific for more)" : "") + ". ⏰ tunes the TV when it starts."
-    : "Nothing found in the next day and a half.";
+    : searchWhen === "now" ? "Nothing like that is on right now." : "Nothing found in the next day and a half.";
 }
 
 let tab = "remote";
