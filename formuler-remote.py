@@ -3341,12 +3341,18 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         info = _xtream(account).get("user_info", {})
         return int(info.get("active_cons") or 0), int(info.get("max_connections") or 1)
 
-    def direct_start(unique_id: str, sleep_box: bool = False) -> dict:
+    def direct_start(unique_id: str, sleep_box: bool = False, vod: dict | None = None) -> dict:
+        """Play a live channel, or with `vod` ({kind: movie|episode, id, ext, title}) a movie or episode."""
         if not account:
             return {"ok": False, "error": "No IPTV account: set IPTV_SERVER, IPTV_USER and IPTV_PASS in .env"}
-        sid = _stream_id(unique_id)
-        if not sid:
-            return {"ok": False, "error": f"Invalid channel id '{unique_id}'"}
+        if vod:
+            if vod.get("kind") not in ("movie", "episode") or not re.fullmatch(r"\d+", str(vod.get("id", ""))) \
+                    or not re.fullmatch(r"[a-z0-9]{2,4}", str(vod.get("ext", ""))):
+                return {"ok": False, "error": "Invalid movie or episode"}
+        else:
+            sid = _stream_id(unique_id)
+            if not sid:
+                return {"ok": False, "error": f"Invalid channel id '{unique_id}'"}
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return {"ok": False, "error": "ffmpeg not found (winget install Gyan.FFmpeg)"}
@@ -3366,28 +3372,51 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                         time.sleep(2)
             except (OSError, ValueError) as e:
                 return {"ok": False, "error": _redact(f"IPTV provider unreachable: {e}")}
-            ch = _cached_channel(unique_id) or {"title": unique_id}
             server, user, password = account
-            video = (["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-vf", "scale=-2:720", "-g", "50"]
-                     if re.search(r"\b(HEVC|H\.?265)\b", ch["title"], re.I) else ["-c:v", "copy"])
+            transcode = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-vf", "scale=-2:720", "-g", "50"]
+            if vod:
+                ch = {"title": str(vod.get("title") or "")[:200] or f"#{vod['id']}"}
+                src = f"{server}/{'movie' if vod['kind'] == 'movie' else 'series'}/{user}/{password}/{vod['id']}.{vod['ext']}"
+                # Most non-4K versions are H.264 and can be passed through; others are re-encoded
+                try:
+                    codec = subprocess.run(
+                        [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=codec_name", "-of", "csv=p=0", src],
+                        capture_output=True, text=True, timeout=30).stdout.strip()
+                except (OSError, subprocess.TimeoutExpired):
+                    codec = ""
+                if not codec:
+                    _direct_stop_locked()
+                    return {"ok": False, "error": "The provider doesn't deliver this video right now "
+                                                  "(it may be broken on their side); try another version."}
+                video = ["-c:v", "copy"] if codec == "h264" else transcode
+                # a file, not a live stream: read a bit ahead of real time and keep every
+                # segment so the player can start at 0 and seek back
+                src_args = ["-reconnect", "1", "-readrate", "2", "-readrate_initial_burst", "30", "-i", src]
+                hls_args = ["-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
+                            "-hls_flags", "independent_segments"]
+            else:
+                ch = _cached_channel(unique_id) or {"title": unique_id}
+                video = transcode if re.search(r"\b(HEVC|H\.?265)\b", ch["title"], re.I) else ["-c:v", "copy"]
+                src_args = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                            "-i", f"{server}/live/{user}/{password}/{sid}.ts"]
+                hls_args = ["-hls_time", "2", "-hls_list_size", "10",
+                            "-hls_flags", "delete_segments+omit_endlist+independent_segments"]
             d = direct["dir"]
             d.mkdir(parents=True, exist_ok=True)
             direct["log"] = open(d / "ffmpeg.log", "w", encoding="utf-8")
-            args = [ffmpeg, "-hide_banner", "-loglevel", "error",
-                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                    "-i", f"{server}/live/{user}/{password}/{sid}.ts",
-                    "-map", "0:v:0", "-map", "0:a:0?", *video, "-c:a", "aac", "-b:a", "128k",
-                    "-f", "hls", "-hls_time", "2", "-hls_list_size", "10",
-                    "-hls_flags", "delete_segments+omit_endlist+independent_segments",
-                    str(d / "live.m3u8")]
+            args = [ffmpeg, "-hide_banner", "-loglevel", "error", *src_args,
+                    "-map", "0:v:0", "-map", "0:a:0?", *video, "-c:a", "aac", "-ac", "2", "-b:a", "160k",
+                    "-f", "hls", *hls_args, str(d / "live.m3u8")]
             extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
             direct["ffmpeg"] = subprocess.Popen(args, stdout=direct["log"], stderr=subprocess.STDOUT,
                                                 stdin=subprocess.DEVNULL, **extra)
             direct["title"], direct["seen"] = ch["title"], time.time()
-            deadline = time.time() + 25
+            deadline = time.time() + (45 if vod else 25)
             while time.time() < deadline and _direct_running():
                 if (d / "live.m3u8").exists():
-                    return {"ok": True, "url": "/direct/live.m3u8", "title": ch["title"]}
+                    return {"ok": True, "url": "/direct/live.m3u8", "title": ch["title"], "vod": bool(vod),
+                            "transcoded": video is transcode}
                 time.sleep(0.5)
             direct["log"].flush()
             try:
@@ -3395,7 +3424,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             except OSError:
                 err = []
             _direct_stop_locked()
-            msg = "Channel did not start: " + (err[0] if err else "no data from the provider")
+            msg = ("Did not start: " if vod else "Channel did not start: ") + (err[0] if err else "no data from the provider")
             if full and not sleep_box:
                 return {"ok": False, "busy": True, "error": _redact(
                     f"{msg}. Your IPTV subscription allows {limit} connection(s) and the TV is probably using it.")}
@@ -3592,6 +3621,80 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
 
     threading.Thread(target=timer_loop, daemon=True).start()
 
+    # ── Movies and series from the provider ──
+    # The catalogs are big (~200k movies, ~45k series, a minute to fetch), so they are
+    # loaded on the first search, kept slim on disk for a day and searched in memory.
+    vod_cat: dict = {"movie": None, "series": None, "state": {}, "error": ""}
+    vod_lock = threading.Lock()
+
+    def _vod_load(kind: str):
+        path = CACHE_DIR / f"vod_{kind}.json"
+        try:
+            if time.time() - path.stat().st_mtime > 24 * 3600:
+                raise OSError("stale")
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            if kind == "movie":
+                rows = [[v["stream_id"], v.get("name") or "", v.get("container_extension") or "mp4", v.get("stream_icon") or ""]
+                        for v in _xtream(account, timeout=240, action="get_vod_streams")]
+            else:
+                rows = [[v["series_id"], v.get("name") or "", "", v.get("cover") or ""]
+                        for v in _xtream(account, timeout=240, action="get_series")]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        vod_cat[kind] = (rows, [_normalize(r[1]) for r in rows])
+
+    def _vod_loader(kind: str):
+        try:
+            _vod_load(kind)
+            vod_cat["state"][kind] = "ready"
+        except Exception as e:  # keep the server up; the next search retries
+            vod_cat["state"][kind], vod_cat["error"] = "error", _redact(f"Catalog unavailable: {e}")
+
+    def vod_search(kind: str, query: str) -> dict:
+        if not account:
+            return {"ok": False, "error": "No IPTV account"}
+        if kind not in ("movie", "series"):
+            return {"ok": False, "error": "type must be movie or series"}
+        with vod_lock:
+            state = vod_cat["state"].get(kind)
+            if state in (None, "error"):
+                vod_cat["state"][kind] = state = "loading"
+                threading.Thread(target=_vod_loader, args=(kind,), daemon=True).start()
+        if state != "ready":
+            return {"ok": True, "state": state, "results": []}
+        needle = _normalize(query)
+        if len(needle) < 2:
+            return {"ok": False, "error": "Type at least 2 letters"}
+        rows, names = vod_cat[kind]
+        hits = []
+        for row, name in zip(rows, names):
+            if needle in name:
+                uhd = bool(re.search(r"\b(4k|uhd|2160p?)\b", name))
+                core = re.sub(r"^[a-z]{2,3}(-4k)?\s*[-|:]\s*|^\[[a-z]{2,3}\]\s*", "", name)
+                hits.append(((not core.startswith(needle), uhd, len(name)), row, uhd))
+        hits.sort(key=lambda h: h[0])
+        return {"ok": True, "state": "ready", "total": len(hits),
+                "results": [{"id": r[0], "name": r[1], "ext": r[2], "icon": r[3], "uhd": uhd} for _, r, uhd in hits[:60]]}
+
+    def vod_series_info(series_id: str) -> dict:
+        if not account or not re.fullmatch(r"\d+", series_id):
+            return {"ok": False, "error": "Invalid series"}
+        try:
+            data = _xtream(account, timeout=30, action="get_series_info", series_id=series_id)
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": _redact(f"Provider unreachable: {e}")}
+        episodes = data.get("episodes") or {}
+        if not isinstance(episodes, dict):
+            episodes = {}
+        seasons = [{"season": str(num), "episodes": [
+                        {"id": e.get("id"), "ext": e.get("container_extension") or "mp4", "num": e.get("episode_num"),
+                         "title": e.get("title") or "", "duration": (e.get("info") or {}).get("duration") or ""}
+                        for e in episodes[num]]}
+                   for num in sorted(episodes, key=lambda k: int(k) if str(k).isdigit() else 0)]
+        info = data.get("info") or {}
+        return {"ok": True, "name": info.get("name") or "", "plot": info.get("plot") or "", "seasons": seasons}
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         if not activity and "mWakefulness=" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]:
@@ -3659,6 +3762,11 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 self._send(200, _app_icon(int(path[6:9])), "image/png")
             elif path == "/api/timers":
                 self._json(timers_list())
+            elif path == "/api/vod/search":
+                q = parse_qs(urlparse(self.path).query)
+                self._json(vod_search((q.get("type") or ["movie"])[0], (q.get("q") or [""])[0]))
+            elif path == "/api/vod/series":
+                self._json(vod_series_info((parse_qs(urlparse(self.path).query).get("id") or [""])[0]))
             elif path == "/api/search":
                 q = parse_qs(urlparse(self.path).query)
                 self._json(guide_search((q.get("q") or [""])[0], (q.get("when") or [""])[0]))
@@ -3728,7 +3836,8 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             elif path == "/api/direct":
                 action = body.get("action")
                 if action == "start":
-                    self._json(direct_start(str(body.get("id", "")), bool(body.get("sleep_box"))))
+                    self._json(direct_start(str(body.get("id", "")), bool(body.get("sleep_box")),
+                                            body.get("vod") if isinstance(body.get("vod"), dict) else None))
                 elif action == "stop":
                     self._json(direct_stop())
                 else:
@@ -3949,7 +4058,7 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
   </section>
   <div class="stack">
     <nav id="tabs" class="tabs" role="tablist" aria-label="Sections">
-      <button role="tab" data-tab="remote" data-mode="tv">Remote</button><button role="tab" data-tab="channels">Channels</button><button role="tab" data-tab="guide" hidden>Guide</button><button role="tab" data-tab="play" data-mode="tv">Movies</button>
+      <button role="tab" data-tab="remote" data-mode="tv">Remote</button><button role="tab" data-tab="channels">Channels</button><button role="tab" data-tab="guide" hidden>Guide</button><button role="tab" data-tab="play" data-mode="tv">Movies</button><button role="tab" data-tab="vod" data-mode="here" hidden>Movies</button>
     </nav>
     <div class="panel stack" data-panel="remote" role="tabpanel">
       <section aria-label="Remote">
@@ -4047,6 +4156,22 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
           <button id="g-more" style="flex:none" hidden>More channels</button>
         </div>
         <p class="hint">Follows the country, type and filter of the channel list. Tap a programme for details.</p>
+      </section>
+    </div>
+    <div class="panel stack" data-panel="vod" role="tabpanel" hidden>
+      <section aria-label="Movies and series">
+        <h2>Movies &amp; series</h2>
+        <div id="vod-type" class="chips">
+          <button data-type="movie" aria-pressed="true">Movies</button><button data-type="series" aria-pressed="false">Series</button>
+        </div>
+        <input id="vod-q" type="search" placeholder="Title, e.g. batman" autocomplete="off" enterkeyhint="search">
+        <div id="vod-results" class="results"></div>
+        <div id="vod-series" hidden>
+          <h2 id="vod-series-name" style="margin-top:14px"></h2>
+          <div id="vod-seasons" class="chips"></div>
+          <div id="vod-episodes" class="results"></div>
+        </div>
+        <p id="vod-hint" class="hint">Plays on this phone straight from the IPTV provider. 4K versions are large and may stutter; a normal version plays smoothly.</p>
       </section>
     </div>
     <div class="panel stack" data-panel="play" role="tabpanel">
@@ -4326,7 +4451,7 @@ function loadScript(src) {
   return new Promise((ok, fail) => { const s = document.createElement("script");
     s.src = src; s.onload = ok; s.onerror = fail; document.head.append(s); });
 }
-async function attachStream(url) {
+async function attachStream(url, vod = false) {
   const v = $("#live");
   $("#preview").hidden = false;
   // Prefer hls.js (MSE): Chrome's experimental native HLS stalls on this live stream.
@@ -4337,7 +4462,7 @@ async function attachStream(url) {
     // and don't speed up to catch up. The TV-screen stream is local and steady (1s
     // segments) and sounded clean with these settings; trimming its back buffer every
     // second made the audio crackle on Android.
-    hls = new Hls(url.includes("/direct/")
+    hls = new Hls(vod ? { startPosition: 0, maxBufferLength: 60 } : url.includes("/direct/")
       ? { liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 9, maxLiveSyncPlaybackRate: 1, maxBufferLength: 30 }
       : { liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxLiveSyncPlaybackRate: 1.2 });
     hls.on(Hls.Events.ERROR, (_, d) => {
@@ -4376,9 +4501,10 @@ async function showNow(id) {
 function stopNow() { clearInterval(nowTimer); $("#now").hidden = true; }
 function setSource(kind, title = "") {
   const el = $("#source");
-  el.hidden = !kind; $("#zap").hidden = !kind;
-  el.className = "source " + (kind || "");
+  el.hidden = !kind; $("#zap").hidden = !kind || kind === "vod";
+  el.className = "source " + (kind === "vod" ? "direct" : kind || "");
   el.textContent = kind === "direct" ? "📡 Direct from IPTV provider" + (title ? " · " + title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "") : "")
+                 : kind === "vod" ? "🎬 From IPTV provider · " + title
                  : kind === "mirror" ? "📺 Mirror of the TV screen" : "";
 }
 async function watchDirect(id, btn) {
@@ -4536,6 +4662,88 @@ async function searchProgrammes() {
   $("#g-search-hint").textContent = r.results.length
     ? `${r.results.length} programmes` + (r.more ? " (first 80; be more specific for more)" : "") + ". ⏰ tunes the TV when it starts."
     : searchWhen === "now" ? "Nothing like that is on right now." : "Nothing found in the next day and a half.";
+}
+
+// ── Movies & series from the provider ──
+let vodType = "movie", vodTimer;
+$("#vod-type").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  vodType = b.dataset.type;
+  for (const k of $("#vod-type").children) k.setAttribute("aria-pressed", String(k === b));
+  $("#vod-series").hidden = true;
+  vodSearch();
+};
+$("#vod-q").oninput = () => { clearTimeout(vodTimer); vodTimer = setTimeout(vodSearch, 400); };
+function vodRow(icon, title, meta, label, onClick, primary) {
+  const row = document.createElement("div"); row.className = "result";
+  const img = document.createElement("img"); img.alt = ""; img.loading = "lazy";
+  if (icon) { img.src = icon; img.onerror = () => img.style.visibility = "hidden"; } else img.style.visibility = "hidden";
+  const txt = document.createElement("div");
+  const a = document.createElement("div"); a.className = "t"; a.textContent = title; a.title = title;
+  const m = document.createElement("div"); m.className = "m"; m.textContent = meta;
+  txt.append(a, m);
+  const b = document.createElement("button"); b.textContent = label; if (primary) b.className = "primary";
+  b.onclick = () => onClick(b);
+  row.append(img, txt, b); return row;
+}
+async function vodSearch() {
+  clearTimeout(vodTimer);
+  const q = $("#vod-q").value.trim(), box = $("#vod-results");
+  if (q.length < 2) { box.replaceChildren(); return; }
+  $("#vod-hint").textContent = "Searching…";
+  const r = await api(`/api/vod/search?type=${vodType}&q=${encodeURIComponent(q)}`).catch(() => null);
+  if (q !== $("#vod-q").value.trim()) return;  // a newer search is running
+  if (!r || !r.ok) { $("#vod-hint").textContent = (r && r.error) || "Search failed"; return; }
+  if (r.state !== "ready") {
+    $("#vod-hint").textContent = r.state === "error" ? "The provider's catalog could not be loaded; trying again…"
+      : "Loading the provider's catalog (about a minute the first time)…";
+    vodTimer = setTimeout(vodSearch, 5000); return;
+  }
+  const movie = vodType === "movie";
+  box.replaceChildren(...r.results.map(v => vodRow(v.icon, v.name,
+    v.uhd ? "4K · large, may stutter" : movie ? "Movie" : "Series",
+    movie ? "Play" : "Episodes",
+    btn => movie ? watchVod({ kind: "movie", id: v.id, ext: v.ext, title: v.name }, btn) : openSeries(v, btn),
+    movie && !v.uhd)));
+  $("#vod-hint").textContent = r.total
+    ? `${r.results.length} of ${r.total}` + (r.total > r.results.length ? "; type more to narrow it down" : "") + ". Normal versions play smoothly; 4K may stutter."
+    : "Nothing found.";
+}
+async function openSeries(v, btn) {
+  if (btn) btn.disabled = true;
+  const r = await api("/api/vod/series?id=" + v.id).catch(() => null);
+  if (btn) btn.disabled = false;
+  if (!r || !r.ok) return toast((r && r.error) || "Could not load the episodes", true);
+  if (!r.seasons.length) return toast("No episodes listed for this series", true);
+  const name = (r.name || v.name).replace(/^[A-Z]{2,3}\s*[-|]\s*|^\[[A-Z]{2,3}\]\s*/, "");
+  $("#vod-series").hidden = false; $("#vod-series-name").textContent = name;
+  const show = (season) => {
+    for (const k of $("#vod-seasons").children) k.setAttribute("aria-pressed", String(k.dataset.season === season.season));
+    $("#vod-episodes").replaceChildren(...season.episodes.map(e => vodRow("", e.title || `Episode ${e.num}`,
+      `S${season.season} E${e.num}` + (e.duration ? " · " + e.duration : ""), "Play",
+      b => watchVod({ kind: "episode", id: e.id, ext: e.ext, title: `${name} S${season.season}E${e.num}` }, b), true)));
+  };
+  $("#vod-seasons").replaceChildren(...r.seasons.map(se => {
+    const b = document.createElement("button"); b.dataset.season = se.season; b.textContent = "Season " + se.season;
+    b.onclick = () => show(se); return b;
+  }));
+  show(r.seasons[0]);
+  $("#vod-series").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+async function watchVod(item, btn) {
+  if (btn) btn.disabled = true;
+  detachStream(); stopNow();
+  toast("Starting… (10 to 30 seconds)");
+  try {
+    const r = await api("/api/direct", { action: "start", vod: item });
+    if (!r.ok) { toast(r.error || "Could not start", true); return; }
+    playing = "direct"; directId = ""; setSource("vod", r.title);
+    await attachStream(r.url + "?t=" + encodeURIComponent(token), true);
+    $("#unwatch").disabled = false;
+    $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    toast("Playing " + r.title + (r.transcoded ? " (converted on the computer)" : ""));
+  } catch (e) { toast(e.message || "Could not start", true); }
+  finally { if (btn) btn.disabled = false; }
 }
 
 let tab = "remote";
