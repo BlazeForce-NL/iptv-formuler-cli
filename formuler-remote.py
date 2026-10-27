@@ -3134,6 +3134,15 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
 
     def live_start() -> dict:
         direct_stop()  # one player on the page
+        result = _live_start_once()
+        if not result["ok"] and "foreground" in (result.get("error") or ""):
+            # the box was still waking up (TV/HDMI handshake); give it more time once
+            adb(ip, "shell", "input", "keyevent", str(KEYS["wakeup"]), timeout=5)
+            time.sleep(5)
+            result = _live_start_once()
+        return result
+
+    def _live_start_once() -> dict:
         with live_lock:
             if _live_running():
                 return {"ok": True, "url": "/live/live.m3u8"}
@@ -3331,6 +3340,8 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
 
     def status() -> dict:
         activity = _get_current_activity(ip)
+        if not activity and "mWakefulness=" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]:
+            activity = "Standby"  # reachable, just asleep
         return {"ok": bool(activity), "activity": activity,
                 # the stream's own scrcpy process would otherwise show up as a mirror
                 "playing": bool(_mol3_media_players(ip)),
