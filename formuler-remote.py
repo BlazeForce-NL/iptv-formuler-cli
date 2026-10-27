@@ -4014,6 +4014,18 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .mode button small { font-weight: 400; font-size: 11px; color: var(--muted); }
 .mode button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 .mode button[aria-pressed="true"] small { color: rgba(255, 255, 255, .8); }
+.popin { position: fixed; z-index: 20; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
+         width: min(calc(100vw - 24px), 440px); background: #000; border-radius: 14px; overflow: hidden;
+         box-shadow: 0 12px 32px rgba(0, 0, 0, .5); }
+.popin-bar { display: flex; align-items: center; gap: 2px; padding: 4px 4px 4px 12px; background: #15171c; color: #fff; }
+.popin-bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.popin-bar button { flex: none; padding: 6px 10px; background: transparent; border: 0; color: #fff; font-size: 18px; line-height: 1; }
+.popin-video { position: relative; aspect-ratio: 16 / 9; }
+.popin-video video { width: 100%; height: 100%; display: block; background: #000; }
+.popin-wait { position: absolute; inset: 0; display: grid; place-items: center; color: #bbb; font-size: 13px;
+              background: #000; pointer-events: none; }
+#now { margin: 0; padding: 4px 12px 8px; background: #15171c; color: #aab; font-size: 12px; }
+body.popin-open { padding-bottom: 300px; }  /* keep the end of the page reachable above the player */
 .g-detail { margin-top: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 10px; }
 .g-detail h3 { margin: 0 0 4px; font-size: 15px; }
 .g-detail p { margin: 4px 0; font-size: 13px; }
@@ -4044,17 +4056,12 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
   <section aria-label="Watch" class="watch">
     <h2>Watch here</h2>
     <div id="source" class="source" hidden></div>
-    <div id="preview" class="preview" hidden><video id="live" playsinline controls></video></div>
-    <p id="now" class="hint" hidden></p>
     <div class="row" style="margin-top:10px">
       <button id="watch" class="primary" data-mode="tv">Mirror TV screen</button>
       <button id="unwatch" disabled>Stop</button>
     </div>
-    <div id="zap" class="row" style="margin-top:8px" hidden>
-      <button id="zap-prev">‹ Previous channel</button><button id="zap-next">Next channel ›</button>
-    </div>
     <p class="hint" data-mode="tv">Channels and the guide tune the TV. <b>Mirror TV screen</b> shows what the TV shows here (the TV is muted until Stop).</p>
-    <p class="hint" data-mode="here" hidden>Pick a channel under Channels or in the Guide: it plays here straight from the IPTV provider, the TV is left alone.</p>
+    <p class="hint" data-mode="here" hidden>Tap a channel, programme or movie: it pops up in a mini player, straight from the IPTV provider. The TV is left alone.</p>
   </section>
   <div class="stack">
     <nav id="tabs" class="tabs" role="tablist" aria-label="Sections">
@@ -4189,6 +4196,15 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
     </div>
   </div>
 </main>
+<div id="popin" class="popin" hidden>
+  <div class="popin-bar">
+    <span id="popin-title"></span>
+    <button id="zap-prev" aria-label="Previous channel" title="Previous channel">‹</button><button id="zap-next" aria-label="Next channel" title="Next channel">›</button>
+    <button id="popin-full" aria-label="Full screen" title="Full screen">⤢</button><button id="popin-close" aria-label="Stop" title="Stop">✕</button>
+  </div>
+  <div class="popin-video"><video id="live" playsinline controls></video><div id="popin-wait" class="popin-wait"></div></div>
+  <p id="now" hidden></p>
+</div>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 const token = new URLSearchParams(location.search).get("t") || "";
@@ -4451,9 +4467,24 @@ function loadScript(src) {
   return new Promise((ok, fail) => { const s = document.createElement("script");
     s.src = src; s.onload = ok; s.onerror = fail; document.head.append(s); });
 }
+let startSeq = 0;  // bumps when a start is superseded or closed, so a late start is dropped
+function popinOpen(title) {
+  $("#popin").hidden = false; document.body.classList.add("popin-open");
+  $("#popin-title").textContent = title;
+  $("#popin-wait").textContent = "Starting " + title + "…"; $("#popin-wait").hidden = false;
+}
+$("#popin-close").onclick = () => {
+  startSeq++;
+  if (playing) $("#unwatch").click(); else detachStream();
+};
+$("#popin-full").onclick = () => {
+  const v = $("#live");
+  (v.requestFullscreen ? v.requestFullscreen() : v.webkitEnterFullscreen && v.webkitEnterFullscreen())?.catch?.(() => {});
+};
 async function attachStream(url, vod = false) {
   const v = $("#live");
-  $("#preview").hidden = false;
+  $("#popin").hidden = false; document.body.classList.add("popin-open");
+  v.addEventListener("playing", () => { $("#popin-wait").hidden = true; }, { once: true });
   // Prefer hls.js (MSE): Chrome's experimental native HLS stalls on this live stream.
   // Fall back to native HLS for browsers without MSE (older iPhones).
   if (!window.Hls) await loadScript("https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js").catch(() => {});
@@ -4482,7 +4513,7 @@ function detachStream() {
   const v = $("#live");
   if (hls) { hls.destroy(); hls = null; }
   v.pause(); v.removeAttribute("src"); v.load();
-  $("#preview").hidden = true;
+  $("#popin").hidden = true; document.body.classList.remove("popin-open");
 }
 let playing = "", directId = "";  // "tv" (screen stream) or "direct" (channel from the provider)
 let nowTimer;
@@ -4501,44 +4532,49 @@ async function showNow(id) {
 function stopNow() { clearInterval(nowTimer); $("#now").hidden = true; }
 function setSource(kind, title = "") {
   const el = $("#source");
-  el.hidden = !kind; $("#zap").hidden = !kind || kind === "vod";
+  el.hidden = !kind;
+  $("#zap-prev").hidden = $("#zap-next").hidden = !kind || kind === "vod";
   el.className = "source " + (kind === "vod" ? "direct" : kind || "");
   el.textContent = kind === "direct" ? "📡 Direct from IPTV provider" + (title ? " · " + title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "") : "")
                  : kind === "vod" ? "🎬 From IPTV provider · " + title
                  : kind === "mirror" ? "📺 Mirror of the TV screen" : "";
+  if (kind) $("#popin-title").textContent = kind === "mirror" ? "📺 TV screen"
+    : (kind === "vod" ? "🎬 " : "📡 ") + title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "");
 }
 async function watchDirect(id, btn) {
   if (btn) btn.disabled = true;
-  detachStream(); stopNow();
-  toast("Starting channel… (about 10 seconds)");
+  detachStream(); stopNow(); setSource("");
+  const seq = ++startSeq, ch = allChannels.find(c => c.id === id);
+  popinOpen(ch ? shortName(ch) : "channel");
   try {
     let r = await api("/api/direct", { action: "start", id });
     if (!r.ok && r.busy && confirm(r.error + "\n\nPut the TV to sleep and try again?")) {
       toast("Putting the TV to sleep and starting the channel…");
       r = await api("/api/direct", { action: "start", id, sleep_box: true });
     }
-    if (!r.ok) { toast(r.error || "Channel failed", true); return; }
+    if (seq !== startSeq) { if (r.ok && !playing) api("/api/direct", { action: "stop" }); return; }
+    if (!r.ok) { detachStream(); toast(r.error || "Channel failed", true); return; }
     playing = "direct"; directId = id; setSource("direct", r.title);
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false; $("#watch").disabled = false;
-    $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
-    toast("Playing " + r.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, ""));
     showNow(id);
-  } catch (e) { toast(e.message || "Channel failed", true); }
+  } catch (e) { if (seq === startSeq) { detachStream(); toast(e.message || "Channel failed", true); } }
   finally { if (btn) btn.disabled = false; }
 }
 $("#watch").onclick = async () => {
   const b = $("#watch"); b.disabled = true;
-  detachStream(); stopNow();
-  toast("Starting stream… (about 10 seconds)");
+  detachStream(); stopNow(); setSource("");
+  const seq = ++startSeq;
+  popinOpen("TV screen");
   try {
     const r = await api("/api/stream", { action: "start" });
-    if (!r.ok) { toast(r.error || "Stream failed", true); b.disabled = false; return; }
+    if (seq !== startSeq) { if (r.ok && !playing) api("/api/stream", { action: "stop" }); b.disabled = false; return; }
+    if (!r.ok) { detachStream(); toast(r.error || "Stream failed", true); b.disabled = false; return; }
     playing = "tv"; setSource("mirror");
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false;
     toast("Streaming. The TV is muted until you press Stop.");
-  } catch (e) { toast(e.message || "Stream failed", true); b.disabled = false; }
+  } catch (e) { detachStream(); toast(e.message || "Stream failed", true); b.disabled = false; }
 };
 $("#unwatch").onclick = async () => {
   detachStream(); stopNow(); setSource("");
@@ -4732,17 +4768,18 @@ async function openSeries(v, btn) {
 }
 async function watchVod(item, btn) {
   if (btn) btn.disabled = true;
-  detachStream(); stopNow();
-  toast("Starting… (10 to 30 seconds)");
+  detachStream(); stopNow(); setSource("");
+  const seq = ++startSeq;
+  popinOpen(item.title);
   try {
     const r = await api("/api/direct", { action: "start", vod: item });
-    if (!r.ok) { toast(r.error || "Could not start", true); return; }
+    if (seq !== startSeq) { if (r.ok && !playing) api("/api/direct", { action: "stop" }); return; }
+    if (!r.ok) { detachStream(); toast(r.error || "Could not start", true); return; }
     playing = "direct"; directId = ""; setSource("vod", r.title);
     await attachStream(r.url + "?t=" + encodeURIComponent(token), true);
     $("#unwatch").disabled = false;
-    $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
-    toast("Playing " + r.title + (r.transcoded ? " (converted on the computer)" : ""));
-  } catch (e) { toast(e.message || "Could not start", true); }
+    if (r.transcoded) toast("Converted on the computer; the picture may start a bit slower");
+  } catch (e) { if (seq === startSeq) { detachStream(); toast(e.message || "Could not start", true); } }
   finally { if (btn) btn.disabled = false; }
 }
 
