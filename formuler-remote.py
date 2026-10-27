@@ -1385,6 +1385,82 @@ def _stream_id(unique_id: str) -> str | None:
     return m.group(1) if m else None
 
 
+# ── Programme guide (XMLTV from IPTV_EPG_LINK) ──
+EPG_FILE = CACHE_DIR / "epg.xml"
+EPG_IDS_FILE = CACHE_DIR / "epg_ids.json"
+
+
+def _epg_link() -> str:
+    return (os.environ.get("IPTV_EPG_LINK") or _dotenv.get("IPTV_EPG_LINK") or "").strip()
+
+
+def _epg_download(url: str, dest: Path):
+    """Stream the (possibly gzipped) XMLTV file to disk; it's ~100 MB."""
+    import gzip
+    from urllib.request import urlopen
+    tmp = dest.with_suffix(".part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(url, timeout=120) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+    with open(tmp, "rb") as f:
+        gzipped = f.read(2) == b"\x1f\x8b"
+    if gzipped:
+        with gzip.open(tmp, "rb") as src, open(dest, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        tmp.unlink()
+    else:
+        tmp.replace(dest)
+
+
+def _xmltv_time(value: str) -> int:
+    """'20261026210000 +0100' -> unix time."""
+    import calendar
+    v = value.strip()
+    t = calendar.timegm((int(v[0:4]), int(v[4:6]), int(v[6:8]), int(v[8:10]), int(v[10:12]), int(v[12:14] or 0)))
+    m = re.search(r"([+-])(\d\d)(\d\d)$", v)
+    if m:
+        offset = int(m.group(2)) * 3600 + int(m.group(3)) * 60
+        t -= offset if m.group(1) == "+" else -offset
+    return t
+
+
+def _epg_parse(path: Path, start: int, end: int) -> dict[str, list[tuple]]:
+    """Programmes per XMLTV channel id overlapping [start, end): (start, stop, title, desc)."""
+    import xml.etree.ElementTree as ET
+    progs: dict[str, list[tuple]] = {}
+    for _, el in ET.iterparse(path, events=("end",)):
+        if el.tag == "programme":
+            try:
+                s, e = _xmltv_time(el.get("start", "")), _xmltv_time(el.get("stop", ""))
+            except (ValueError, IndexError):
+                el.clear()
+                continue
+            if e > start and s < end:
+                desc = (el.findtext("desc") or "").strip()
+                progs.setdefault(el.get("channel", ""), []).append(
+                    (s, e, (el.findtext("title") or "").strip(), desc[:400]))
+            el.clear()
+        elif el.tag == "channel":
+            el.clear()
+    for lst in progs.values():
+        lst.sort()
+    return progs
+
+
+def _epg_ids(account: tuple[str, str, str], max_age_hours: float = 24) -> dict[str, str]:
+    """Provider stream id -> XMLTV channel id, from get_live_streams (cached; ~20s to fetch)."""
+    try:
+        if time.time() - EPG_IDS_FILE.stat().st_mtime < max_age_hours * 3600:
+            return json.loads(EPG_IDS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    streams = _xtream(account, timeout=120, action="get_live_streams")
+    ids = {str(s["stream_id"]): s["epg_channel_id"] for s in streams if s.get("epg_channel_id")}
+    EPG_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EPG_IDS_FILE.write_text(json.dumps(ids), encoding="utf-8")
+    return ids
+
+
 def channel_by_number(ip: str, number: str) -> dict | None:
     for ch in get_full_channels(ip):
         if ch.get("number") == number:
@@ -3338,6 +3414,50 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         progs = sorted((p for p in progs if p["end"] > time.time()), key=lambda p: p["start"])[:2]
         return {"ok": True, "programmes": progs}
 
+    # ── Programme guide ──
+    # The XMLTV file is downloaded at most every 12 hours (it's ~100 MB and slow) and
+    # indexed in memory for 3 hours back to 36 hours ahead, re-indexed every hour.
+    guide = {"progs": {}, "ids": {}, "state": "off", "error": "", "parsed": 0.0}
+    EPG_MAX_AGE = 12 * 3600
+
+    def guide_loader():
+        link = _epg_link()
+        if not (account and link):
+            return
+        while True:
+            try:
+                age = time.time() - EPG_FILE.stat().st_mtime if EPG_FILE.exists() else None
+                if age is None or age > EPG_MAX_AGE:
+                    if not guide["progs"]:
+                        guide["state"] = "downloading"
+                    _epg_download(link, EPG_FILE)
+                    guide["parsed"] = 0
+                if time.time() - guide["parsed"] > 3600:
+                    if not guide["progs"]:
+                        guide["state"] = "indexing"
+                    guide["ids"] = _epg_ids(account)
+                    now = int(time.time())
+                    guide["progs"] = _epg_parse(EPG_FILE, now - 3 * 3600, now + 36 * 3600)
+                    guide["parsed"], guide["state"], guide["error"] = time.time(), "ready", ""
+            except Exception as e:  # keep the server up; retry later
+                guide["error"] = _redact(f"Guide unavailable: {e}")
+                if not guide["progs"]:
+                    guide["state"] = "error"
+            time.sleep(600)
+
+    threading.Thread(target=guide_loader, daemon=True).start()
+
+    def guide_for(unique_ids: list[str], start: int, end: int) -> dict:
+        if guide["state"] != "ready":
+            return {"ok": guide["state"] != "error", "state": guide["state"], "error": guide["error"] or None,
+                    "channels": {}}
+        out = {}
+        for uid in unique_ids[:400]:
+            epg_id = guide["ids"].get(_stream_id(str(uid)) or "")
+            progs = guide["progs"].get(epg_id or "", [])
+            out[uid] = [p for p in progs if p[1] > start and p[0] < end]
+        return {"ok": True, "state": "ready", "channels": out}
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         if not activity and "mWakefulness=" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]:
@@ -3396,7 +3516,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 self._send(200, WEB_REMOTE_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/countries":
                 self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()],
-                            "direct": bool(account)})
+                            "direct": bool(account), "guide": bool(account and _epg_link())})
             elif path == "/api/channels":
                 country = (parse_qs(urlparse(self.path).query).get("country") or ["nl"])[0].lower()
                 if country not in COUNTRIES:
@@ -3445,6 +3565,13 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     self._json(live_stop())
                 else:
                     self._json({"ok": False, "error": "action must be start or stop"}, 400)
+            elif path == "/api/guide":
+                try:
+                    ids = [str(i) for i in body.get("ids") or []]
+                    start, end = int(body.get("from") or time.time()), int(body.get("to") or time.time() + 6 * 3600)
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "Bad request"}, 400)
+                self._json(guide_for(ids, start, end))
             elif path == "/api/direct":
                 action = body.get("action")
                 if action == "start":
@@ -3540,6 +3667,26 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .chips button { flex: none; padding: 6px 12px; border-radius: 99px; font-size: 13px; }
 .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-2); color: #fff; }
 .chips button[hidden] { display: none; }
+.guide { overflow: auto; max-height: 70vh; border: 1px solid var(--line); border-radius: 10px; }
+.g-inner { position: relative; }
+.g-row { position: relative; height: 54px; border-bottom: 1px solid var(--line); }
+.g-times { position: sticky; top: 0; z-index: 3; height: 28px; background: var(--panel); }
+.g-ch { position: sticky; left: 0; z-index: 2; width: 96px; height: 100%; box-sizing: border-box; display: flex;
+        align-items: center; gap: 6px; padding: 0 6px; background: var(--panel); border-right: 1px solid var(--line);
+        font-size: 12px; overflow: hidden; }
+.g-ch img { width: 30px; height: 20px; object-fit: contain; flex: none; }
+.g-ch span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.g-tick { position: absolute; top: 6px; font-size: 11px; color: var(--muted); padding-left: 4px; border-left: 1px solid var(--line); }
+.g-p { position: absolute; top: 4px; bottom: 4px; padding: 4px 6px; border-radius: 6px; font-size: 12px; text-align: left;
+       overflow: hidden; white-space: nowrap; text-overflow: ellipsis; display: block; }
+.g-p small { display: block; color: var(--muted); font-size: 11px; }
+.g-p.now { border-color: var(--accent); }
+.g-p.past { opacity: .55; }
+.g-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--err); z-index: 1; pointer-events: none; }
+.g-detail { margin-top: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 10px; }
+.g-detail h3 { margin: 0 0 4px; font-size: 15px; }
+.g-detail p { margin: 4px 0; font-size: 13px; }
+.g-detail .when { color: var(--muted); font-size: 12px; }
 .ch { display: grid; gap: 4px; justify-items: center; padding: 8px 6px; font-size: 12px; }
 .ch img { width: 56px; height: 34px; object-fit: contain; }
 .ch .num { color: var(--muted); font-size: 11px; }
@@ -3646,6 +3793,20 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
         <label class="toggle" style="flex:none"><input id="variants" type="checkbox" style="width:auto"> All variants</label>
       </div>
       <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.</p>
+    </section>
+
+    <section aria-label="Guide" id="guide-sec" hidden>
+      <h2>Guide</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button id="g-prev">‹ Earlier</button><button id="g-now">Now</button><button id="g-next">Later ›</button>
+      </div>
+      <div id="guide" class="guide"></div>
+      <div id="g-detail" class="g-detail" hidden></div>
+      <div class="row" style="margin-top:8px; align-items:center">
+        <p id="g-hint" class="hint" style="margin:0"></p>
+        <button id="g-more" style="flex:none" hidden>More channels</button>
+      </div>
+      <p class="hint">Follows the country, type and filter of the channel list. Tap a programme for details.</p>
     </section>
 
     <section aria-label="Play">
@@ -3765,7 +3926,105 @@ function renderChannels() {
       + (list.length > 300 ? ", first 300 shown, filter to narrow" : "")
     : "No channels found for this country.";
   for (const k of $("#kinds").children) k.hidden = !!k.dataset.kind && !allChannels.some(c => c.kind === k.dataset.kind);
+  shownGroups = list; scheduleGuide();
 }
+function playGroup(c, btn) {
+  if (target === "here") watchDirect(c.id, btn); else run("tune-id " + c.id, btn);
+}
+
+// ── Programme guide ──
+let shownGroups = [], guideOn = false, guideCount = 40, guideFrom = 0, guideTimer, guideScrolled = -1;
+const PX = 3, CH_W = 96, SPAN = 6 * 3600;  // 3 px per minute, 6 hours per view
+const halfHour = t => Math.floor(t / 1800) * 1800;
+const hm = s => new Date(s * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const shortName = c => c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "").replace(QUALITY, "").trim() || c.title;
+function scheduleGuide() { clearTimeout(guideTimer); if (guideOn) guideTimer = setTimeout(renderGuide, 300); }
+async function renderGuide() {
+  clearTimeout(guideTimer);
+  if (!guideOn) return;
+  const nowS = Date.now() / 1000;
+  if (!guideFrom) guideFrom = halfHour(nowS - 1800);
+  const from = guideFrom, to = from + SPAN;
+  const groups = shownGroups.slice(0, guideCount);
+  const box = $("#guide");
+  $("#g-more").hidden = shownGroups.length <= guideCount;
+  if (!groups.length) { box.replaceChildren(); $("#g-hint").textContent = "No channels to show."; return; }
+  const r = await api("/api/guide", { ids: groups.flatMap(g => g.map(c => c.id)), from, to }).catch(() => null);
+  if (!r || !r.ok) { $("#g-hint").textContent = (r && r.error) || "Guide unavailable"; return; }
+  if (r.state !== "ready") {
+    $("#g-hint").textContent = r.state === "downloading"
+      ? "Downloading the programme guide (a few minutes the first time)…" : "Preparing the programme guide…";
+    guideTimer = setTimeout(renderGuide, 15000); return;
+  }
+  const x = t => CH_W + (Math.min(Math.max(t, from), to) - from) / 60 * PX;
+  const inner = document.createElement("div"); inner.className = "g-inner";
+  inner.style.width = (CH_W + SPAN / 60 * PX) + "px";
+  const head = document.createElement("div"); head.className = "g-row g-times";
+  const day = document.createElement("div"); day.className = "g-ch";
+  day.textContent = new Date(from * 1000).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+  head.append(day);
+  for (let t = from; t < to; t += 1800) {
+    const l = document.createElement("span"); l.className = "g-tick"; l.style.left = x(t) + "px"; l.textContent = hm(t);
+    head.append(l);
+  }
+  inner.append(head);
+  let rows = 0;
+  for (const g of groups) {
+    const c = g.find(v => (r.channels[v.id] || []).length);
+    if (!c) continue;
+    const row = document.createElement("div"); row.className = "g-row";
+    const ch = document.createElement("div"); ch.className = "g-ch"; ch.title = g[0].title;
+    const logo = g.find(v => v.logo)?.logo;
+    if (logo) { const i = document.createElement("img"); i.src = logo; i.alt = ""; i.loading = "lazy"; i.onerror = () => i.remove(); ch.append(i); }
+    const n = document.createElement("span"); n.textContent = shortName(g[0]); ch.append(n);
+    row.append(ch);
+    for (const [s, e, title, desc] of r.channels[c.id]) {
+      if (e <= from || s >= to) continue;
+      const p = document.createElement("button");
+      p.className = "g-p" + (s <= nowS && nowS < e ? " now" : e <= nowS ? " past" : "");
+      p.style.left = x(s) + "px"; p.style.width = Math.max(x(e) - x(s) - 2, 4) + "px";
+      p.textContent = title;
+      const t = document.createElement("small"); t.textContent = hm(s); p.append(t);
+      p.onclick = () => showProgramme(g, s, e, title, desc);
+      row.append(p);
+    }
+    inner.append(row); rows++;
+  }
+  if (nowS >= from && nowS < to) {
+    const line = document.createElement("div"); line.className = "g-line"; line.style.left = x(nowS) + "px"; inner.append(line);
+  }
+  const top = box.scrollTop, left = box.scrollLeft;
+  box.replaceChildren(inner);
+  box.scrollTop = top;
+  // jump to "now" (or the start) when the time window changed, keep the position otherwise
+  box.scrollLeft = guideScrolled === from ? left : (nowS >= from && nowS < to ? x(nowS) - CH_W - 40 : 0);
+  guideScrolled = from;
+  const hidden = groups.length - rows;
+  $("#g-hint").textContent = rows ? `${rows} channels` + (hidden ? `, ${hidden} without guide data hidden` : "")
+                                  : "No guide data for these channels.";
+}
+function showProgramme(g, s, e, title, desc) {
+  const d = $("#g-detail"), nowS = Date.now() / 1000;
+  const h = document.createElement("h3"); h.textContent = title;
+  const w = document.createElement("p"); w.className = "when";
+  w.textContent = new Date(s * 1000).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })
+    + ` ${hm(s)}–${hm(e)} · ${shortName(g[0])}`;
+  const p = document.createElement("p"); p.textContent = desc || "No description.";
+  d.replaceChildren(h, w, p);
+  if (s <= nowS && nowS < e) {
+    const b = document.createElement("button"); b.className = "primary";
+    b.textContent = target === "here" ? "Watch on this device" : "Watch on TV";
+    b.onclick = () => playGroup(g[0], b);
+    d.append(b);
+  }
+  d.hidden = false;
+  d.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+$("#g-prev").onclick = () => { const nowS = Date.now() / 1000; guideFrom = Math.max((guideFrom || halfHour(nowS - 1800)) - 3 * 3600, halfHour(nowS - 3 * 3600)); renderGuide(); };
+$("#g-next").onclick = () => { const nowS = Date.now() / 1000; guideFrom = Math.min((guideFrom || halfHour(nowS - 1800)) + 3 * 3600, halfHour(nowS + 30 * 3600)); renderGuide(); };
+$("#g-now").onclick = () => { guideFrom = 0; renderGuide(); };
+$("#g-more").onclick = () => { guideCount += 40; renderGuide(); };
+setInterval(() => { if (guideOn && !document.hidden) renderGuide(); }, 300000);  // moves the "now" line
 $("#filter").oninput = renderChannels;
 $("#variants").onchange = renderChannels;
 $("#kinds").onclick = (e) => {
@@ -3787,6 +4046,7 @@ async function loadCountries() {
   const r = await api("/api/countries");
   const list = r.countries || [];
   $("#target").hidden = !r.direct;
+  guideOn = !!r.guide; $("#guide-sec").hidden = !guideOn;
   if (!r.direct) target = "tv";
   for (const b of $("#target").children) b.setAttribute("aria-pressed", String(b.dataset.target === target));
   if (!list.some(c => c.code === country)) country = list[0]?.code || "nl";

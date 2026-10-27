@@ -200,6 +200,7 @@ It prints a link like `http://192.168.0.185:8765/?t=…`. Open it on your phone 
 - **Speed:** key presses go through one persistent `adb shell`; other commands run one at a time through the CLI.
 - **Watch here:** streams the box's picture and sound to the browser (needs [scrcpy](https://github.com/Genymobile/scrcpy) and [ffmpeg](https://ffmpeg.org/): `winget install Genymobile.scrcpy Gyan.FFmpeg`). scrcpy records the screen without a window, ffmpeg turns it into ~1s HLS segments, and the page plays them with [hls.js](https://github.com/video-dev/hls.js) (native HLS as fallback). Expect a few seconds of delay. On Android 11 the TV is muted while streaming; **Stop** gives the sound back. The stream restarts itself every ~70 minutes to keep its temp file small.
 - **Play on this device:** with an Xtream Codes account in `.env` (see [IPTV provider](#iptv-provider-optional)) the channel list gets a *Play on TV / Play on this device* switch. On this device, the server's ffmpeg pulls the channel straight from the provider and remuxes it to HLS (audio to AAC; channels tagged HEVC/H265 are re-encoded to 720p H.264), so you can watch something else than the TV. The current and next programme come from the provider's EPG. Many subscriptions allow one connection: when it's in use (usually by the TV) the page offers to put the TV to sleep first. The stream stops by itself about a minute after the last player went away.
+- **Guide:** with `IPTV_EPG_LINK` (an XMLTV URL) next to the account in `.env`, the page shows a programme grid for the channels in the list (same country, type and filter), 6 hours per view from 3 hours back to about 30 hours ahead. Tap a programme for its description; one that's on now can be watched from there. The server downloads the XMLTV file in the background at most every 12 hours (it can be ~100 MB, a few minutes the first time) to `~/.cache/formuler-remote/epg.xml` and keeps an index in memory; channels are matched through the provider's `epg_channel_id`.
 - **Windows:** allow Python through the firewall for private networks when asked, otherwise the phone can't connect.
 
 ### Interactive Mode
@@ -439,6 +440,7 @@ For *Play on this device* in the web remote, add your provider's Xtream Codes lo
 IPTV_SERVER=http://provider.example:8080
 IPTV_USER=your-username
 IPTV_PASS=your-password
+IPTV_EPG_LINK=http://provider.example:8080/xmltv.php?username=...&password=...   # optional, for the guide
 ```
 Channel tiles map to provider streams through the MyTVOnline channel id (`2_<group>_<stream>_0`), so it works for the channels the box lists.
 
