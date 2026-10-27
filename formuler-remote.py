@@ -902,32 +902,46 @@ _ALL_EPISODES_LABELS = ("alle afleveringen", "all episodes", "tous les episodes"
                         "alle folgen", "todos los episodios", "tutti gli episodi")
 
 
+# Movie detail page: 'Kijken' starts the movie ('Voorbeeld' below it is the trailer)
+_WATCH_LABELS = ("kijken", "afspelen", "watch", "play", "regarder", "lire", "ansehen", "abspielen",
+                 "ver", "reproducir", "guarda", "riproduci")
+_RESUME_LABELS = ("doorgaan", "verder kijken", "continue", "resume", "reprendre", "fortsetzen",
+                  "continuar", "riprendi")
+
+
 def open_all_episodes(ip: str) -> bool:
-    """On a series detail page, focus the 'All episodes' action and press OK.
+    """On a series detail page, focus the 'All episodes' action and press OK."""
+    return _press_detail_action(ip, _ALL_EPISODES_LABELS)
+
+
+def _press_detail_action(ip: str, *label_sets: tuple[str, ...]) -> bool:
+    """On a detail page, focus the first action matching a label set and press OK.
 
     The focused action differs per firmware and watch state (e.g. 'Doorgaan',
     or the trailer 'Voorbeeld' row), so the label is looked up instead of
-    pressing OK on whatever happens to be focused.
+    pressing OK on whatever happens to be focused. Earlier label sets win.
     """
     rid = "detail_overview_action_label"
 
     def target(texts):
-        for i, t in enumerate(texts):
-            if _normalize(t) in _ALL_EPISODES_LABELS:
-                return i
+        for labels in label_sets:
+            for i, t in enumerate(texts):
+                if _normalize(t) in labels:
+                    return i
         return None
 
     # Focus may sit below the action row (e.g. on the trailer); move up into it
-    for _ in range(4):
+    # Focus may sit above the action row (movie description) or below it (trailer row)
+    for move in ("down", "up", "up", "up", "up", None):
         root = _ui_root(ip)
         if root is None:
             return False
         if _focused_texts(root, rid):
             break
-        key(ip, "up")
+        if move is None:
+            return False
+        key(ip, move)
         wait(NAV_DELAY * 2)
-    else:
-        return False
 
     if not _move_focus_to(ip, rid, target):
         return False
@@ -1026,14 +1040,18 @@ def play_movie(ip: str, query: str):
     # Slow path: UI-based search
     if not do_search(ip, query, section="vod"):
         return
-    select_first_result(ip)
-    # Detail overlay: focus is on description. Down to "Regarder" button.
+    title = select_matching_result(ip, query)
+    if not title:
+        output_err(f"No movie result matching '{query}'")
+        return
     wait(LOAD_DELAY * 0.5)
-    key(ip, "down")   # description → "Regarder" button
-    wait(NAV_DELAY)
     before = _mol3_media_players(ip)
-    key(ip, "ok")     # start playback
-    _report_playback(ip, before, f"movie: '{query}'", {"query": query, "method": "search"})
+    # The watch action by its label: pressing whatever is focused opened the trailer
+    if not _press_detail_action(ip, _WATCH_LABELS, _RESUME_LABELS):
+        output_err(f"Could not find the watch button for '{title}'")
+        return
+    _report_playback(ip, before, f"movie: '{_clean_result_title(title)}'",
+                     {"query": query, "title": title, "method": "search"})
 
 
 # ══════════════════════════════════════════════════════════════
