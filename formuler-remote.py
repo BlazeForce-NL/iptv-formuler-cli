@@ -1341,7 +1341,14 @@ def cmd_tune_id(ip: str, unique_id: str):
     if not re.fullmatch(r"[\w.-]+", unique_id):
         error(f"Invalid channel id '{unique_id}'")
         return
-    ch = {"title": unique_id, "unique_id": unique_id}
+    ch = _cached_channel(unique_id) or {"title": unique_id, "unique_id": unique_id}
+    output_ok(f"Tuning to: {ch['title']}", ch)
+    _record_tune(ch)
+    _tune_by_uid(ip, unique_id)
+
+
+def _cached_channel(unique_id: str) -> dict | None:
+    """Look a channel up in the channel caches by its unique id."""
     for path in [FULL_CHANNELS_CACHE, *CACHE_DIR.glob("country_*.json")]:
         try:
             with open(path, encoding="utf-8") as f:
@@ -1349,11 +1356,33 @@ def cmd_tune_id(ip: str, unique_id: str):
         except (OSError, json.JSONDecodeError):
             continue
         if hit:
-            ch = hit
-            break
-    output_ok(f"Tuning to: {ch['title']}", ch)
-    _record_tune(ch)
-    _tune_by_uid(ip, unique_id)
+            return hit
+    return None
+
+
+# ── IPTV provider (Xtream Codes API) ──
+# Optional: with IPTV_SERVER / IPTV_USER / IPTV_PASS in .env the web remote can play
+# a channel straight from the provider on the phone, without the box.
+
+def _iptv_account() -> tuple[str, str, str] | None:
+    get = lambda k: (os.environ.get(k) or _dotenv.get(k) or "").strip()
+    server, user, password = get("IPTV_SERVER").rstrip("/"), get("IPTV_USER"), get("IPTV_PASS")
+    return (server, user, password) if server and user and password else None
+
+
+def _xtream(account: tuple[str, str, str], timeout: int = 20, **params) -> dict | list:
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+    server, user, password = account
+    query = urlencode({"username": user, "password": password, **params})
+    with urlopen(f"{server}/player_api.php?{query}", timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _stream_id(unique_id: str) -> str | None:
+    """Provider stream id from a MyTVOnline unique id (2_<group>_<stream>_0)."""
+    m = re.fullmatch(r"\d+_\d+_(\d+)_\d+", unique_id)
+    return m.group(1) if m else None
 
 
 def channel_by_number(ip: str, number: str) -> dict | None:
@@ -3104,6 +3133,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         return " | ".join(lines[-2:])
 
     def live_start() -> dict:
+        direct_stop()  # one player on the page
         with live_lock:
             if _live_running():
                 return {"ok": True, "url": "/live/live.m3u8"}
@@ -3169,17 +3199,138 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
 
     threading.Thread(target=live_watchdog, daemon=True).start()
 
+    # ── Direct stream from the IPTV provider ──
+    # ffmpeg pulls the channel from the provider and remuxes it to HLS; only the audio
+    # is re-encoded (AC3/MP2 don't play in browsers), HEVC channels get H.264 at 720p.
+    # The box isn't involved, but subscriptions often allow a single connection.
+    account = _iptv_account()
+    direct = {"ffmpeg": None, "dir": TMP_DIR / "formuler-direct", "log": None, "title": "", "seen": 0.0}
+    direct_lock = threading.Lock()
+    DIRECT_IDLE = 60  # stop when no player fetched the playlist for this long (frees the connection)
+
+    def _redact(text: str) -> str:
+        for secret in account[1:] if account else ():
+            text = text.replace(secret, "***")
+        return text
+
+    def _direct_running() -> bool:
+        return direct["ffmpeg"] is not None and direct["ffmpeg"].poll() is None
+
+    def _direct_stop_locked():
+        _kill(direct["ffmpeg"])
+        direct["ffmpeg"], direct["title"] = None, ""
+        if direct["log"]:
+            direct["log"].close()
+            direct["log"] = None
+        shutil.rmtree(direct["dir"], ignore_errors=True)
+
+    def _connections() -> tuple[int, int]:
+        info = _xtream(account).get("user_info", {})
+        return int(info.get("active_cons") or 0), int(info.get("max_connections") or 1)
+
+    def direct_start(unique_id: str, sleep_box: bool = False) -> dict:
+        if not account:
+            return {"ok": False, "error": "No IPTV account: set IPTV_SERVER, IPTV_USER and IPTV_PASS in .env"}
+        sid = _stream_id(unique_id)
+        if not sid:
+            return {"ok": False, "error": f"Invalid channel id '{unique_id}'"}
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return {"ok": False, "error": "ffmpeg not found (winget install Gyan.FFmpeg)"}
+        live_stop()  # one player on the page; also gives the TV its sound back
+        with direct_lock:
+            was_running = _direct_running()
+            _direct_stop_locked()
+            try:
+                active, limit = _connections()
+                if active >= limit and not was_running:
+                    if not sleep_box:
+                        return {"ok": False, "busy": True, "error": (
+                            f"Your IPTV subscription allows {limit} connection(s) and "
+                            f"{'it is' if limit == 1 else 'all are'} in use, probably by the TV.")}
+                    adb(ip, "shell", "input", "keyevent", str(KEYS["sleep"]), timeout=5)
+                    deadline = time.time() + 20
+                    while time.time() < deadline and _connections()[0] >= limit:
+                        time.sleep(2)
+            except (OSError, ValueError) as e:
+                return {"ok": False, "error": _redact(f"IPTV provider unreachable: {e}")}
+            ch = _cached_channel(unique_id) or {"title": unique_id}
+            server, user, password = account
+            video = (["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-vf", "scale=-2:720", "-g", "50"]
+                     if re.search(r"\b(HEVC|H\.?265)\b", ch["title"], re.I) else ["-c:v", "copy"])
+            d = direct["dir"]
+            d.mkdir(parents=True, exist_ok=True)
+            direct["log"] = open(d / "ffmpeg.log", "w", encoding="utf-8")
+            args = [ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                    "-i", f"{server}/live/{user}/{password}/{sid}.ts",
+                    "-map", "0:v:0", "-map", "0:a:0?", *video, "-c:a", "aac", "-b:a", "128k",
+                    "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+                    "-hls_flags", "delete_segments+omit_endlist+independent_segments",
+                    str(d / "live.m3u8")]
+            extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
+            direct["ffmpeg"] = subprocess.Popen(args, stdout=direct["log"], stderr=subprocess.STDOUT,
+                                                stdin=subprocess.DEVNULL, **extra)
+            direct["title"], direct["seen"] = ch["title"], time.time()
+            deadline = time.time() + 25
+            while time.time() < deadline and _direct_running():
+                if (d / "live.m3u8").exists():
+                    return {"ok": True, "url": "/direct/live.m3u8", "title": ch["title"]}
+                time.sleep(0.5)
+            direct["log"].flush()
+            try:
+                err = (d / "ffmpeg.log").read_text(encoding="utf-8", errors="replace").strip().splitlines()[-1:]
+            except OSError:
+                err = []
+            _direct_stop_locked()
+            return {"ok": False, "error": _redact("Channel did not start: " + (err[0] if err else "no data from the provider"))}
+
+    def direct_stop() -> dict:
+        with direct_lock:
+            _direct_stop_locked()
+        return {"ok": True}
+
+    def direct_watchdog():
+        while True:
+            time.sleep(15)
+            with direct_lock:
+                if _direct_running() and time.time() - direct["seen"] > DIRECT_IDLE:
+                    _direct_stop_locked()
+
+    threading.Thread(target=direct_watchdog, daemon=True).start()
+
+    def now_next(unique_id: str) -> dict:
+        """Current and next programme from the provider's short EPG."""
+        import base64
+        sid = _stream_id(unique_id)
+        if not account or not sid:
+            return {"ok": False, "error": "No IPTV account or invalid channel id"}
+        try:
+            data = _xtream(account, action="get_short_epg", stream_id=sid, limit=6)
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": _redact(f"EPG unavailable: {e}")}
+        def text(v):
+            try:
+                return base64.b64decode(v).decode("utf-8", "replace")
+            except ValueError:
+                return v or ""
+        progs = [{"title": text(p.get("title")), "start": int(p.get("start_timestamp") or 0),
+                  "end": int(p.get("stop_timestamp") or 0)} for p in data.get("epg_listings", [])]
+        # the listing can start with programmes that already ended
+        progs = sorted((p for p in progs if p["end"] > time.time()), key=lambda p: p["start"])[:2]
+        return {"ok": True, "programmes": progs}
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         return {"ok": bool(activity), "activity": activity,
                 # the stream's own scrcpy process would otherwise show up as a mirror
                 "playing": bool(_mol3_media_players(ip)),
                 "mirror": _mirror_running() and not _live_running(),
-                "streaming": _live_running()}
+                "streaming": _live_running(),
+                "direct": direct["title"] if _direct_running() else ""}
 
-    def live_file(name: str) -> tuple[bytes, str] | None:
+    def hls_file(hls: Path, name: str) -> tuple[bytes, str] | None:
         """HLS playlist (segment URLs get the token appended) or a segment."""
-        hls = live["dir"] / "hls"
         if name == "live.m3u8":
             try:
                 text = (hls / name).read_text(encoding="utf-8")
@@ -3224,7 +3375,8 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             if path == "/":
                 self._send(200, WEB_REMOTE_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/countries":
-                self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()]})
+                self._json({"ok": True, "countries": [{"code": k, "name": v[0]} for k, v in COUNTRIES.items()],
+                            "direct": bool(account)})
             elif path == "/api/channels":
                 country = (parse_qs(urlparse(self.path).query).get("country") or ["nl"])[0].lower()
                 if country not in COUNTRIES:
@@ -3238,8 +3390,13 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     self._send(200, png, "image/png")
                 else:
                     self._json({"ok": False, "error": "Screenshot failed"}, 502)
-            elif path.startswith("/live/"):
-                found = live_file(path[len("/live/"):])
+            elif path == "/api/epg":
+                self._json(now_next((parse_qs(urlparse(self.path).query).get("id") or [""])[0]))
+            elif path.startswith(("/live/", "/direct/")):
+                kind, _, name = path[1:].partition("/")
+                if kind == "direct":
+                    direct["seen"] = time.time()
+                found = hls_file(live["dir"] / "hls" if kind == "live" else direct["dir"], name)
                 if found:
                     self._send(200, *found)
                 else:
@@ -3268,6 +3425,14 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     self._json(live_stop())
                 else:
                     self._json({"ok": False, "error": "action must be start or stop"}, 400)
+            elif path == "/api/direct":
+                action = body.get("action")
+                if action == "start":
+                    self._json(direct_start(str(body.get("id", "")), bool(body.get("sleep_box"))))
+                elif action == "stop":
+                    self._json(direct_stop())
+                else:
+                    self._json({"ok": False, "error": "action must be start or stop"}, 400)
             else:
                 self._json({"ok": False, "error": "Not found"}, 404)
 
@@ -3291,6 +3456,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
     finally:
         server.server_close()
         live_stop()  # gives the TV its sound back
+        direct_stop()  # frees the IPTV connection
         if key_shell["proc"] is not None:
             key_shell["proc"].kill()
         _keep_connection = False
@@ -3419,11 +3585,13 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
       <h2>Watch here</h2>
       <div class="preview"><video id="live" playsinline controls hidden></video>
         <div id="live-empty" class="empty">Stream the TV picture and sound to this device</div></div>
+      <p id="now" class="hint" hidden></p>
       <div class="row" style="margin-top:10px">
         <button id="watch" class="primary">Watch here</button>
         <button id="unwatch" disabled>Stop</button>
       </div>
-      <p class="hint">Runs a few seconds behind the TV. On this box (Android 11) the TV is muted while streaming; Stop gives the sound back.</p>
+      <p class="hint">Runs a few seconds behind the TV. On this box (Android 11) the TV is muted while streaming; Stop gives the sound back.
+        Channels picked with “Play on this device” come straight from the IPTV provider and leave the TV alone.</p>
     </section>
 
     <section aria-label="Screen">
@@ -3442,6 +3610,9 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 
     <section aria-label="Channels">
       <h2>Channels</h2>
+      <div id="target" class="chips" aria-label="Play on" hidden>
+        <button data-target="tv" aria-pressed="true">Play on TV</button><button data-target="here" aria-pressed="false">Play on this device</button>
+      </div>
       <div id="countries" class="chips" role="tablist" aria-label="Country"></div>
       <div id="kinds" class="chips" aria-label="Type">
         <button data-kind="" aria-pressed="true">All</button><button data-kind="tv" aria-pressed="false">TV</button>
@@ -3508,6 +3679,7 @@ document.addEventListener("click", (e) => {
   if (!b) return;
   if (b.dataset.key) key(b.dataset.key);
   else if (b.dataset.cmd) run(b.dataset.cmd, b);
+  else if (b.dataset.direct) watchDirect(b.dataset.direct, b);
 });
 document.addEventListener("keydown", (e) => {
   if (e.target.matches("input, select")) return;
@@ -3530,8 +3702,8 @@ $("#auto").onchange = (e) => {
   clearInterval(autoTimer);
   if (e.target.checked) { refreshShot(); autoTimer = setInterval(refreshShot, 5000); }
 };
-let allChannels = [], country = "nl", kind = "";
-try { country = localStorage.getItem("country") || "nl"; } catch (e) {}
+let allChannels = [], country = "nl", kind = "", target = "tv";
+try { country = localStorage.getItem("country") || "nl"; target = localStorage.getItem("target") || "tv"; } catch (e) {}
 const QUALITY = /\s*\b(ULTRA\s+)?(4K|UHD|FHD|HD|HEVC|H265|SD|LQ|HQ|50FPS)\b|[ᴬ-ᵡ◉²]+/gi;
 function renderChannels() {
   const q = $("#filter").value.trim().toLowerCase();
@@ -3554,7 +3726,8 @@ function renderChannels() {
   const box = $("#channels"); box.innerHTML = "";
   for (const g of list.slice(0, 300)) {
     const c = g[0], b = document.createElement("button");
-    b.className = "ch"; b.dataset.cmd = "tune-id " + c.id;
+    b.className = "ch";
+    if (target === "here") b.dataset.direct = c.id; else b.dataset.cmd = "tune-id " + c.id;
     b.title = g.length > 1 ? `${c.title} (best of ${g.length}: ${g.map(v => v.q || "SD").join(", ")})` : c.title;
     let name = c.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, "");
     if (!all) name = name.replace(QUALITY, "").trim() || name;
@@ -3593,6 +3766,9 @@ async function loadChannels() {
 async function loadCountries() {
   const r = await api("/api/countries");
   const list = r.countries || [];
+  $("#target").hidden = !r.direct;
+  if (!r.direct) target = "tv";
+  for (const b of $("#target").children) b.setAttribute("aria-pressed", String(b.dataset.target === target));
   if (!list.some(c => c.code === country)) country = list[0]?.code || "nl";
   $("#countries").replaceChildren(...list.map(c => {
     const b = document.createElement("button");
@@ -3605,6 +3781,13 @@ $("#countries").onclick = (e) => {
   country = b.dataset.country;
   try { localStorage.setItem("country", country); } catch (err) {}
   loadChannels();
+};
+$("#target").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  target = b.dataset.target;
+  try { localStorage.setItem("target", target); } catch (err) {}
+  for (const k of $("#target").children) k.setAttribute("aria-pressed", String(k === b));
+  renderChannels();
 };
 $("#play").onclick = () => {
   const title = $("#title").value.trim();
@@ -3645,30 +3828,70 @@ function detachStream() {
   v.pause(); v.removeAttribute("src"); v.load();
   v.hidden = true; $("#live-empty").hidden = false;
 }
+let playing = "";  // "tv" (screen stream) or "direct" (channel from the provider)
+let nowTimer;
+async function showNow(id) {
+  clearInterval(nowTimer);
+  const el = $("#now");
+  const update = async () => {
+    const r = await api("/api/epg?id=" + encodeURIComponent(id)).catch(() => null);
+    const p = (r && r.programmes) || [];
+    const hm = s => new Date(s * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    el.textContent = p.length ? `Now: ${p[0].title} (${hm(p[0].start)}–${hm(p[0].end)})` + (p[1] ? ` · Next: ${p[1].title}` : "") : "";
+    el.hidden = !p.length;
+  };
+  await update(); nowTimer = setInterval(update, 60000);
+}
+function stopNow() { clearInterval(nowTimer); $("#now").hidden = true; }
+async function watchDirect(id, btn) {
+  if (btn) btn.disabled = true;
+  detachStream(); stopNow();
+  toast("Starting channel… (about 10 seconds)");
+  try {
+    let r = await api("/api/direct", { action: "start", id });
+    if (!r.ok && r.busy && confirm(r.error + "\n\nPut the TV to sleep and watch here?")) {
+      toast("Putting the TV to sleep and starting the channel…");
+      r = await api("/api/direct", { action: "start", id, sleep_box: true });
+    }
+    if (!r.ok) { toast(r.error || "Channel failed", true); return; }
+    playing = "direct";
+    await attachStream(r.url + "?t=" + encodeURIComponent(token));
+    $("#unwatch").disabled = false; $("#watch").disabled = false;
+    $("#live").scrollIntoView({ behavior: "smooth", block: "center" });
+    toast("Playing " + r.title.replace(/^[A-Z.]{2,4}\s*\|\s*/, ""));
+    showNow(id);
+  } catch (e) { toast(e.message || "Channel failed", true); }
+  finally { if (btn) btn.disabled = false; }
+}
 $("#watch").onclick = async () => {
   const b = $("#watch"); b.disabled = true;
+  detachStream(); stopNow();
   toast("Starting stream… (about 10 seconds)");
   try {
     const r = await api("/api/stream", { action: "start" });
     if (!r.ok) { toast(r.error || "Stream failed", true); b.disabled = false; return; }
+    playing = "tv";
     await attachStream(r.url + "?t=" + encodeURIComponent(token));
     $("#unwatch").disabled = false;
     toast("Streaming. The TV is muted until you press Stop.");
   } catch (e) { toast(e.message || "Stream failed", true); b.disabled = false; }
 };
 $("#unwatch").onclick = async () => {
-  detachStream();
-  await api("/api/stream", { action: "stop" });
+  detachStream(); stopNow();
+  await api(playing === "direct" ? "/api/direct" : "/api/stream", { action: "stop" });
+  toast(playing === "direct" ? "Channel stopped" : "Stream stopped, sound is back on the TV");
+  playing = "";
   $("#watch").disabled = false; $("#unwatch").disabled = true;
-  toast("Stream stopped, sound is back on the TV");
 };
 async function refreshState() {
   try {
     const s = await api("/api/status");
     const el = $("#state");
     const label = s.activity === "LiveActivity" ? "Live TV" : (s.activity || "Offline").replace(/Activity$/, "");
-    el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "") + (s.streaming ? " · streaming" : "");
-    if (s.streaming) $("#unwatch").disabled = false;  // also when started from another device
+    el.textContent = (s.playing ? "▶ " : "") + label + (s.mirror ? " · mirroring" : "") + (s.streaming ? " · streaming" : "")
+      + (s.direct ? " · on device" : "");
+    if (s.streaming || s.direct) $("#unwatch").disabled = false;  // also when started from another device
+    if (!playing && (s.streaming || s.direct)) playing = s.direct ? "direct" : "tv";
     el.className = "pill" + (s.playing ? " on" : "");
   } catch (e) { $("#state").textContent = "Offline"; }
 }
