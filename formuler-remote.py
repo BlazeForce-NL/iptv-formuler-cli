@@ -3143,6 +3143,15 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                 return {"ok": False, "error": "scrcpy not found (winget install Genymobile.scrcpy)"}
             if not ffmpeg:
                 return {"ok": False, "error": "ffmpeg not found (winget install Gyan.FFmpeg)"}
+            # Android 11 only allows audio capture while the device is awake
+            # ("audio capture must be started in the foreground")
+            awake = lambda: "mWakefulness=Awake" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]
+            if not awake():
+                adb(ip, "shell", "input", "keyevent", str(KEYS["wakeup"]), timeout=5)
+                deadline = time.time() + 10
+                while time.time() < deadline and not awake():
+                    time.sleep(0.5)
+                time.sleep(LOAD_DELAY)  # let the player come back to the foreground
             d = live["dir"]
             (d / "hls").mkdir(parents=True, exist_ok=True)
             mkv = d / "live.mkv"
