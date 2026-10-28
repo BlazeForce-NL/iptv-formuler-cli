@@ -3503,7 +3503,7 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
             return {"ok": guide["state"] != "error", "state": guide["state"], "error": guide["error"] or None,
                     "channels": {}}
         out = {}
-        for uid in unique_ids[:400]:
+        for uid in unique_ids[:1500]:
             epg_id = guide["ids"].get(_stream_id(str(uid)) or "")
             progs = guide["progs"].get(epg_id or "", [])
             out[uid] = [p for p in progs if p[1] > start and p[0] < end]
@@ -3695,6 +3695,42 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
         info = data.get("info") or {}
         return {"ok": True, "name": info.get("name") or "", "plot": info.get("plot") or "", "seasons": seasons}
 
+    # ── Channel previews (long-press on a tile) ──
+    # One frame per request, cached a few minutes; at most two grabs at once since the
+    # provider counts each as a connection.
+    thumbs: dict[str, tuple[float, bytes]] = {}
+    thumb_slots = threading.Semaphore(2)
+    THUMB_MAX_AGE = 180
+
+    def thumbnail(unique_id: str) -> bytes | None:
+        sid = _stream_id(unique_id)
+        ffmpeg = shutil.which("ffmpeg")
+        if not account or not sid or not ffmpeg:
+            return None
+        hit = thumbs.get(sid)
+        if hit and time.time() - hit[0] < THUMB_MAX_AGE:
+            return hit[1]
+        if not thumb_slots.acquire(timeout=20):
+            return None
+        server, user, password = account
+        extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "500000", "-analyzeduration", "1000000",
+                 "-i", f"{server}/live/{user}/{password}/{sid}.ts", "-frames:v", "1", "-vf", "scale=320:-2",
+                 "-q:v", "6", "-f", "image2", "-c:v", "mjpeg", "pipe:1"],
+                capture_output=True, timeout=20, stdin=subprocess.DEVNULL, **extra)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        finally:
+            thumb_slots.release()
+        if r.returncode or not r.stdout:
+            return None
+        thumbs[sid] = (time.time(), r.stdout)
+        for old in sorted(thumbs, key=lambda k: thumbs[k][0])[:-200]:  # keep the cache small
+            thumbs.pop(old, None)
+        return r.stdout
+
     def status() -> dict:
         activity = _get_current_activity(ip)
         if not activity and "mWakefulness=" in adb(ip, "shell", "dumpsys power | grep mWakefulness=", timeout=5)[1]:
@@ -3786,6 +3822,12 @@ def cmd_serve(ip: str, port: int = 8765, local_only: bool = False):
                     self._send(200, png, "image/png")
                 else:
                     self._json({"ok": False, "error": "Screenshot failed"}, 502)
+            elif path == "/api/thumb":
+                jpg = thumbnail((parse_qs(urlparse(self.path).query).get("id") or [""])[0])
+                if jpg:
+                    self._send(200, jpg, "image/jpeg")
+                else:
+                    self._json({"ok": False, "error": "No preview"}, 502)
             elif path == "/api/epg":
                 self._json(now_next((parse_qs(urlparse(self.path).query).get("id") or [""])[0]))
             elif path.startswith(("/live/", "/direct/")):
@@ -4018,7 +4060,15 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
 .g-detail h3 { margin: 0 0 4px; font-size: 15px; }
 .g-detail p { margin: 4px 0; font-size: 13px; }
 .g-detail .when { color: var(--muted); font-size: 12px; }
-.ch { display: grid; gap: 4px; justify-items: center; padding: 8px 6px; font-size: 12px; }
+.ch { position: relative; display: grid; gap: 4px; justify-items: center; align-content: start; padding: 8px 6px; font-size: 12px;
+      -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.ch .now { color: var(--muted); font-size: 11px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ch .prog { width: 100%; height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.ch .prog i { display: block; height: 100%; background: var(--accent); }
+.ch img.thumb { width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; }
+.ch.loading::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+                     background: color-mix(in srgb, var(--accent) 22%, transparent); animation: pulse .8s infinite alternate; }
+@keyframes pulse { from { opacity: .25; } to { opacity: 1; } }
 .ch img { width: 56px; height: 34px; object-fit: contain; }
 .ch .num { color: var(--muted); font-size: 11px; }
 .ch .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
@@ -4127,7 +4177,8 @@ input, select { font: inherit; color: var(--text); background: var(--panel-2); b
           <p id="ch-hint" class="hint" style="margin:0"></p>
           <label class="toggle" style="flex:none"><input id="variants" type="checkbox" style="width:auto"> All variants</label>
         </div>
-        <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.</p>
+        <p class="hint">Variants of one channel (4K, FHD, HD, LQ…) show as one tile that tunes the best quality.
+          <span id="hold-hint" hidden>Hold a channel for a moment to see what's on it right now.</span></p>
       </section>
     </div>
     <div class="panel stack" data-panel="guide" role="tabpanel">
@@ -4224,6 +4275,7 @@ async function run(cmd, btn) {
 document.addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (!b) return;
+  if (b.dataset.lp) { delete b.dataset.lp; return; }  // that was a long press (preview)
   if (b.dataset.key) key(b.dataset.key);
   else if (b.dataset.cmd) run(b.dataset.cmd, b);
   else if (b.dataset.direct) watchDirect(b.dataset.direct, b);
@@ -4270,7 +4322,14 @@ function renderChannels() {
     const n = document.createElement("span"); n.className = "num";
     n.textContent = c.number + (!all && c.q ? " · " + c.q : "") + (g.length > 1 ? ` · +${g.length - 1}` : "");
     const t = document.createElement("span"); t.className = "name"; t.textContent = name;
-    b.append(n, t); box.append(b);
+    const now = document.createElement("span"); now.className = "now"; now.hidden = true;
+    const bar = document.createElement("span"); bar.className = "prog"; bar.hidden = true; bar.append(document.createElement("i"));
+    b.dataset.ids = g.slice(0, 4).map(v => v.id).join(",");
+    // previews come quicker from an HD/FHD variant than from 4K
+    b.dataset.pv = (g.find(v => v.rank === 5 || v.rank === 3) || c).id;
+    b.append(n, t, now, bar); box.append(b);
+    const hit = thumbCache.get(b.dataset.pv);
+    if (hit && Date.now() - hit.at < 180000) applyThumb(b, hit.url);
   }
   const total = groups.filter(g => !kind || g[0].kind === kind).length;
   $("#ch-hint").textContent = allChannels.length
@@ -4278,7 +4337,7 @@ function renderChannels() {
       + (list.length > 300 ? ", first 300 shown, filter to narrow" : "")
     : "No channels found for this country.";
   for (const k of $("#kinds").children) k.hidden = !!k.dataset.kind && !allChannels.some(c => c.kind === k.dataset.kind);
-  shownGroups = list; scheduleGuide();
+  shownGroups = list; scheduleGuide(); scheduleNowOn();
 }
 function playGroup(c, btn) {
   if (target === "here") watchDirect(c.id, btn); else run("tune-id " + c.id, btn);
@@ -4404,6 +4463,7 @@ async function loadCountries() {
   const list = r.countries || [];
   $("#target").hidden = !r.direct;
   guideOn = !!r.guide; $('#tabs [data-tab="guide"]').hidden = !guideOn;
+  directOn = !!r.direct; $("#hold-hint").hidden = !directOn;
   if (!guideOn && tab === "guide") showTab("channels");
   if (!r.direct) target = "tv";
   applyMode();
@@ -4745,6 +4805,76 @@ async function watchVod(item, btn) {
   } catch (e) { toast(e.message || "Could not start", true); }
   finally { if (btn) btn.disabled = false; }
 }
+
+// ── Tiles: what's on now, and a live frame on long press ──
+let nowOnTimer, nowOnData = {}, directOn = false;
+const thumbCache = new Map();  // preview channel id -> { url, at }
+function scheduleNowOn() { clearTimeout(nowOnTimer); nowOnTimer = setTimeout(loadNowOn, 300); }
+async function loadNowOn() {
+  clearTimeout(nowOnTimer);
+  const tiles = [...document.querySelectorAll("#channels .ch")];
+  if (!guideOn || !tiles.length) return;
+  const nowS = Date.now() / 1000;
+  const r = await api("/api/guide", { ids: tiles.flatMap(t => t.dataset.ids.split(",")), from: nowS, to: nowS + 3600 }).catch(() => null);
+  if (!r || !r.ok) return;
+  if (r.state !== "ready") { nowOnTimer = setTimeout(loadNowOn, 15000); return; }
+  nowOnData = r.channels; paintNowOn();
+}
+function paintNowOn() {
+  const nowS = Date.now() / 1000;
+  for (const t of document.querySelectorAll("#channels .ch")) {
+    let p = null;
+    for (const id of t.dataset.ids.split(",")) {
+      p = (nowOnData[id] || []).find(x => x[0] <= nowS && nowS < x[1]);
+      if (p) break;
+    }
+    const el = t.querySelector(".now"), bar = t.querySelector(".prog");
+    el.hidden = bar.hidden = !p;
+    if (!p) continue;
+    el.textContent = p[2];
+    bar.firstChild.style.width = Math.min(100, (nowS - p[0]) / (p[1] - p[0]) * 100) + "%";
+  }
+}
+setInterval(() => { if (!document.hidden) paintNowOn(); }, 60000);
+setInterval(() => { if (!document.hidden && tab === "channels") loadNowOn(); }, 300000);
+
+function applyThumb(b, url) {
+  let img = b.querySelector("img.thumb");
+  if (!img) {
+    b.querySelector("img")?.remove();  // the logo makes way for the picture
+    img = document.createElement("img"); img.className = "thumb"; img.alt = "";
+    b.prepend(img);
+  }
+  img.src = url;
+}
+async function preview(b) {
+  if (navigator.vibrate) navigator.vibrate(15);
+  const id = b.dataset.pv, hit = thumbCache.get(id);
+  if (hit && Date.now() - hit.at < 180000) return applyThumb(b, hit.url);
+  const tiles = () => [...document.querySelectorAll("#channels .ch")].filter(t => t.dataset.pv === id);
+  for (const t of tiles()) t.classList.add("loading");
+  try {
+    const r = await fetch("/api/thumb?id=" + encodeURIComponent(id), { headers: { "X-Token": token } });
+    if (!r.ok) throw new Error();
+    const url = URL.createObjectURL(await r.blob());
+    if (hit) URL.revokeObjectURL(hit.url);
+    thumbCache.set(id, { url, at: Date.now() });
+    for (const t of tiles()) applyThumb(t, url);  // the list may have been re-rendered meanwhile
+  } catch (e) { toast("No preview for this channel right now", true); }
+  finally { for (const t of tiles()) t.classList.remove("loading"); }
+}
+let lpTimer, lpStart;
+$("#channels").addEventListener("pointerdown", (e) => {
+  const b = e.target.closest(".ch"); if (!b || !directOn) return;
+  lpStart = [e.clientX, e.clientY];
+  clearTimeout(lpTimer);
+  lpTimer = setTimeout(() => { b.dataset.lp = "1"; preview(b); }, 450);
+});
+for (const ev of ["pointerup", "pointercancel", "pointerleave"]) $("#channels").addEventListener(ev, () => clearTimeout(lpTimer));
+$("#channels").addEventListener("pointermove", (e) => {  // scrolling, not holding
+  if (lpStart && Math.hypot(e.clientX - lpStart[0], e.clientY - lpStart[1]) > 10) clearTimeout(lpTimer);
+});
+$("#channels").addEventListener("contextmenu", (e) => { if (e.target.closest(".ch")) e.preventDefault(); });
 
 let tab = "remote";
 try { tab = localStorage.getItem("tab") || "remote"; } catch (e) {}
